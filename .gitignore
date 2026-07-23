@@ -1,0 +1,14 @@
+market.db
+__pycache__/
+*.pyc
+*.log
+.env
+.env.production
+static/profiles/*.jpg
+static/product_uploads/*.jpg
+static/chat_uploads/*.jpg
+backups/*.db
+backups/*.wmbak
+admin-initial-password.txt
+local-security-env.ps1
+tmp/

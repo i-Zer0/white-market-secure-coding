@@ -1,0 +1,42 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - ${WHITE_MARKET_ENV_FILE:-.env.production}
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8010
+      WHITE_MARKET_ENV: production
+      WHITE_MARKET_HTTPS: "1"
+    volumes:
+      - market-data:/app/data
+      - profile-uploads:/app/static/profiles
+      - product-uploads:/app/static/product_uploads
+      - chat-uploads:/app/static/chat_uploads
+    expose:
+      - "8010"
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    env_file:
+      - ${WHITE_MARKET_ENV_FILE:-.env.production}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  market-data:
+  profile-uploads:
+  product-uploads:
+  chat-uploads:
+  caddy-data:
+  caddy-config:
