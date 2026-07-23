@@ -124,8 +124,3 @@ $env:WHITE_MARKET_HTTPS="1"
 
 첫 실행 시 아이디 `admin`과 `WHITE_MARKET_ADMIN_PASSWORD` 값으로 관리자 계정을 만듭니다. 기본 비밀번호는 코드에 존재하지 않으며 최초 로그인 직후 반드시 새 비밀번호로 변경해야 합니다.
 
-## GitHub 업로드 전 확인
-
-- `market.db`는 실행 중 생성되는 로컬 데이터베이스이므로 GitHub에 올리지 않습니다.
-- GitHub에는 소스와 `tests/`, `.github/workflows/security.yml`을 포함합니다. `market.db`, `backups/*.db`, 사용자 업로드 사진은 개인정보가 될 수 있어 제외합니다.
-- 과제 보고서에는 이 저장소 링크와 실행 방법, 구현 과정, 보안 개선 내용을 함께 작성하면 됩니다.
