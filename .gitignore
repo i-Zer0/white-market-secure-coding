@@ -14,3 +14,5 @@ local-security-env.ps1
 tmp/
 output/pdf/*.pdf
 docs/
+tools/
+tests/
