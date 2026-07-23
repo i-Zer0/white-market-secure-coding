@@ -20,10 +20,12 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Compile
         run: python -m py_compile app.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
       - name: Install Bandit
         run: python -m pip install bandit
       - name: Security scan
-        run: bandit -q -lll -r app.py
+        run: bandit -q -lll -r app.py -x tests
 
   dependency-review:
     if: github.event_name == 'pull_request'
