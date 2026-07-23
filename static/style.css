@@ -1117,9 +1117,44 @@ small {
   margin-bottom: 16px;
 }
 
-.login-help {
-  margin: 14px 0 0;
+.login-options {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin: 2px 0 4px;
+}
+
+.login-options > a,
+.login-two-factor summary {
+  color: var(--accent-dark);
+  font-weight: 700;
+}
+
+.login-two-factor {
+  max-width: 100%;
+}
+
+.login-two-factor:not([open]) > :not(summary) {
+  display: none;
+}
+
+.login-two-factor summary {
+  cursor: pointer;
+}
+
+.login-two-factor[open] {
+  flex-basis: 100%;
+}
+
+.login-two-factor[open] summary {
+  margin-bottom: 10px;
   text-align: center;
+}
+
+.login-two-factor label {
+  text-align: left;
 }
 
 .dev-code {
@@ -1692,6 +1727,29 @@ small {
   background: #fbfcfa;
 }
 
+.chat-transaction-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid #dcebd7;
+  background: #f1f8ee;
+}
+
+.chat-transaction-control span {
+  display: grid;
+  gap: 2px;
+}
+
+.chat-transaction-control small {
+  color: var(--muted);
+}
+
+.chat-transaction-control.complete {
+  background: #f5f5f5;
+}
+
 .chat-action-tools {
   display: flex;
   gap: 8px;
@@ -2196,6 +2254,11 @@ th {
   .chat-action-tools form {
     display: grid;
     grid-template-columns: 1fr;
+  }
+
+  .chat-transaction-control {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .chat-action-card {

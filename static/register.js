@@ -6,6 +6,9 @@
   const location = document.querySelector("#location");
   const locationButton = document.querySelector("#location-detect");
   const locationStatus = document.querySelector("#location-status");
+  const password = document.querySelector("#password");
+  const passwordConfirm = document.querySelector("#password-confirm");
+  const passwordConfirmStatus = document.querySelector("#password-confirm-status");
 
   if (!form || !username || !checkButton || !status) return;
 
@@ -23,6 +26,20 @@
 
   const permissionDeniedMessage =
     "위치 권한이 차단되어 있습니다. 주소창 왼쪽의 사이트 설정에서 위치를 허용한 뒤 새로고침하거나 동네를 직접 입력해 주세요.";
+
+  const validatePasswordConfirmation = () => {
+    if (!password || !passwordConfirm || !passwordConfirmStatus) return true;
+    const matches = password.value === passwordConfirm.value;
+    const hasConfirmation = passwordConfirm.value.length > 0;
+    passwordConfirm.setCustomValidity(matches ? "" : "비밀번호가 일치하지 않습니다.");
+    passwordConfirmStatus.textContent = hasConfirmation
+      ? matches
+        ? "비밀번호가 일치합니다."
+        : "비밀번호가 일치하지 않습니다. 다시 입력해주세요."
+      : "";
+    passwordConfirmStatus.className = `field-status ${hasConfirmation && matches ? "success" : hasConfirmation ? "error" : ""}`;
+    return matches;
+  };
 
   const requestCurrentLocation = () => {
     locationButton.disabled = true;
@@ -92,12 +109,20 @@
   });
 
   form.addEventListener("submit", (event) => {
+    if (!validatePasswordConfirmation()) {
+      event.preventDefault();
+      passwordConfirm.focus();
+      return;
+    }
     if (checkedUsername !== username.value.trim()) {
       event.preventDefault();
       setStatus("아이디 중복확인을 진행하세요.", "error");
       username.focus();
     }
   });
+
+  password?.addEventListener("input", validatePasswordConfirmation);
+  passwordConfirm?.addEventListener("input", validatePasswordConfirmation);
 
   if (location && locationButton && locationStatus) {
     locationButton.addEventListener("click", async () => {
