@@ -114,10 +114,9 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 
-$adminPassword = Read-Host "초기 관리자 비밀번호" -AsSecureString
-$backupKey = Read-Host "16자 이상의 백업 암호화 키" -AsSecureString
-$env:WHITE_MARKET_ADMIN_PASSWORD = [System.Net.NetworkCredential]::new("", $adminPassword).Password
-$env:WHITE_MARKET_BACKUP_KEY = [System.Net.NetworkCredential]::new("", $backupKey).Password
+# 아래 예시 값은 반드시 본인만의 값으로 변경하세요.
+$env:WHITE_MARKET_ADMIN_PASSWORD="ReplaceWithYourAdmin1!"
+$env:WHITE_MARKET_BACKUP_KEY="ReplaceWithYourSeparateBackupKey1!"
 
 python app.py
 ```
@@ -140,11 +139,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 
-read -rsp "초기 관리자 비밀번호: " WHITE_MARKET_ADMIN_PASSWORD
-echo
-read -rsp "16자 이상의 백업 암호화 키: " WHITE_MARKET_BACKUP_KEY
-echo
-export WHITE_MARKET_ADMIN_PASSWORD WHITE_MARKET_BACKUP_KEY
+# 아래 예시 값은 반드시 본인만의 값으로 변경하세요.
+export WHITE_MARKET_ADMIN_PASSWORD='ReplaceWithYourAdmin1!'
+export WHITE_MARKET_BACKUP_KEY='ReplaceWithYourSeparateBackupKey1!'
 
 python app.py
 ```
