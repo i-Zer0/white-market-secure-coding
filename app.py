@@ -36,6 +36,7 @@ MAX_PROFILE_IMAGE_BYTES = 500_000
 MAX_PRODUCT_IMAGE_BYTES = 900_000
 MAX_CHAT_IMAGE_BYTES = 900_000
 MAX_PRODUCT_IMAGES = 8
+INITIAL_DEMO_BALANCE = 1_000_000
 SESSION_SECONDS = 8 * 60 * 60
 CAPTCHA_SECONDS = 5 * 60
 PASSWORD_RESET_SECONDS = 5 * 60
@@ -67,6 +68,7 @@ NOTIFICATION_PREFERENCES = {
     "appointment": "notify_chat",
     "price_drop": "notify_price",
     "transaction": "notify_transaction",
+    "payment": "notify_transaction",
     "notice": "notify_notice",
     "security": "notify_security",
 }
@@ -922,10 +924,28 @@ def init_db():
                 seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 buyer_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 status TEXT NOT NULL DEFAULT '거래요청',
+                agreed_price INTEGER NOT NULL DEFAULT 0 CHECK(agreed_price >= 0),
                 review TEXT NOT NULL DEFAULT '',
                 rating INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS wallets (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                balance INTEGER NOT NULL DEFAULT 0 CHECK(balance >= 0),
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS wallet_transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reference_code TEXT NOT NULL UNIQUE,
+                transaction_id INTEGER NOT NULL UNIQUE REFERENCES transactions(id) ON DELETE RESTRICT,
+                sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                receiver_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                amount INTEGER NOT NULL CHECK(amount > 0),
+                created_at TEXT NOT NULL,
+                CHECK(sender_id != receiver_id)
             );
 
             CREATE TABLE IF NOT EXISTS user_ratings (
@@ -1145,6 +1165,16 @@ def init_db():
         action_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chat_actions)").fetchall()}
         if "supersedes_id" not in action_columns:
             conn.execute("ALTER TABLE chat_actions ADD COLUMN supersedes_id INTEGER REFERENCES chat_actions(id) ON DELETE SET NULL")
+        transaction_columns = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+        if "agreed_price" not in transaction_columns:
+            conn.execute("ALTER TABLE transactions ADD COLUMN agreed_price INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            UPDATE transactions
+            SET agreed_price = COALESCE((SELECT price FROM products WHERE products.id = transactions.product_id), 0)
+            WHERE agreed_price <= 0
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_product ON messages(product_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_id, receiver_id, product_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_actions_conversation ON chat_actions(product_id, buyer_id, seller_id)")
@@ -1153,6 +1183,8 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_notifications_cleanup ON notifications(user_id, is_read, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_search_history_term ON search_history(query_text, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_transaction_history_tx ON transaction_history(transaction_id, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_transfers_sender ON wallet_transfers(sender_id, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_transfers_receiver ON wallet_transfers(receiver_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON user_recovery_codes(user_id, used_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_login_events_user ON login_events(user_id, id DESC)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone != ''")
@@ -1209,6 +1241,14 @@ def init_db():
                     )
 
         seed_demo_market(conn)
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO wallets(user_id, balance, updated_at)
+            SELECT id, ?, ? FROM users
+            """,
+            (INITIAL_DEMO_BALANCE, now()),
+        )
 
         conn.execute(
             """
@@ -1303,6 +1343,7 @@ class App(BaseHTTPRequestHandler):
                 ("POST", "/transaction/request"): self.request_transaction,
                 ("GET", "/transactions"): self.transactions_page,
                 ("POST", "/transaction/status"): self.update_transaction_status,
+                ("POST", "/transaction/payment"): self.transfer_transaction_payment,
                 ("POST", "/transaction/review"): self.review_transaction,
                 ("POST", "/transaction/checklist"): self.update_transaction_checklist,
                 ("GET", "/transaction/evidence"): self.transaction_evidence,
@@ -1616,10 +1657,11 @@ class App(BaseHTTPRequestHandler):
                       (SELECT COUNT(*) FROM transactions WHERE (seller_id = ? OR buyer_id = ?) AND status IN ('거래요청', '예약중')) AS active_trade_count,
                       (SELECT COUNT(*) FROM messages WHERE receiver_id = ? AND is_read = 0) AS received_message_count,
                       (SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0) AS unread_notification_count,
+                      COALESCE((SELECT balance FROM wallets WHERE user_id = ?), 0) AS wallet_balance,
                       COALESCE((SELECT AVG(score) FROM user_ratings WHERE reviewee_id = ?), 0) AS rating_average,
                       (SELECT COUNT(*) FROM user_ratings WHERE reviewee_id = ?) AS rating_count
                     """,
-                    (user["id"], user["id"], user["id"], user["id"], user["id"], user["id"], user["id"], user["id"]),
+                    (user["id"], user["id"], user["id"], user["id"], user["id"], user["id"], user["id"], user["id"], user["id"]),
                 ).fetchone()
         card_csrf = self.csrf_input(user) if user else ""
         cards = "".join(product_card(p, viewer=user, csrf=card_csrf, return_to=self.path) for p in products) or "<p>등록된 상품이 없습니다.</p>"
@@ -1638,6 +1680,7 @@ class App(BaseHTTPRequestHandler):
                 <a href="/mypage"><strong>{account_summary["product_count"]}</strong><span>내가 올린 상품</span></a>
                 <a href="/mypage"><strong>{account_summary["favorite_count"]}</strong><span>찜한 상품</span></a>
                 <a href="/transactions"><strong>{account_summary["active_trade_count"]}</strong><span>진행 중 거래</span></a>
+                <a href="/transactions"><strong>{won(account_summary["wallet_balance"])}</strong><span>WM 포인트</span></a>
                 <a href="/chat"><strong>{account_summary["received_message_count"]}</strong><span>읽지 않은 채팅</span></a>
                 <a href="/notifications"><strong>{account_summary["unread_notification_count"]}</strong><span>새 알림</span></a>
               </div>
@@ -1859,6 +1902,10 @@ class App(BaseHTTPRequestHandler):
                     """,
                     (username, salt, digest, display_name, phone, location, now()),
                 ).lastrowid
+                conn.execute(
+                    "INSERT INTO wallets(user_id, balance, updated_at) VALUES (?, ?, ?)",
+                    (user_id, INITIAL_DEMO_BALANCE, now()),
+                )
         except sqlite3.IntegrityError:
             return self.register_page({"error": "이미 사용 중인 아이디 또는 휴대전화 번호입니다."}, form)
         except ValueError as exc:
@@ -2174,6 +2221,7 @@ class App(BaseHTTPRequestHandler):
                 "SELECT u.* FROM user_blocks b JOIN users u ON u.id = b.blocked_id WHERE b.blocker_id = ?",
                 (user["id"],),
             ).fetchall()
+            wallet = conn.execute("SELECT balance FROM wallets WHERE user_id = ?", (user["id"],)).fetchone()
         alert_items = "".join(
             f'<li>{esc(a["keyword"])} <form method="post" action="/alerts/delete" class="inline">{self.csrf_input(user)}<input type="hidden" name="id" value="{a["id"]}"><button>삭제</button></form></li>'
             for a in alerts
@@ -2204,6 +2252,13 @@ class App(BaseHTTPRequestHandler):
                 </form>
               </div>
               <div class="panel">
+                <div class="wallet-compact">
+                  <span>내 WM 포인트</span>
+                  <strong>{won(wallet["balance"] if wallet else 0)}</strong>
+                  <small>실제 현금 가치가 없는 교육용 포인트입니다.</small>
+                  <a class="button account-page-link" href="/transactions">송금·거래 내역</a>
+                </div>
+                <hr>
                 <h2>키워드 알림</h2>
                 <form method="post" action="/alerts" class="inline">
                   {self.csrf_input(user)}
@@ -3334,6 +3389,14 @@ class App(BaseHTTPRequestHandler):
                 "SELECT action, details, ip_address, created_at FROM account_audit_logs WHERE user_id = ? ORDER BY id",
                 (user["id"],),
             ).fetchall()
+            wallet = conn.execute("SELECT balance, updated_at FROM wallets WHERE user_id = ?", (user["id"],)).fetchone()
+            wallet_transfers = conn.execute(
+                """
+                SELECT reference_code, transaction_id, sender_id, receiver_id, amount, created_at
+                FROM wallet_transfers WHERE sender_id = ? OR receiver_id = ? ORDER BY id
+                """,
+                (user["id"], user["id"]),
+            ).fetchall()
             write_account_log(conn, user["id"], "개인정보 다운로드", "", self.client_address[0])
 
         def rows_to_dicts(rows):
@@ -3350,6 +3413,8 @@ class App(BaseHTTPRequestHandler):
             "notifications": rows_to_dicts(notifications),
             "login_events": rows_to_dicts(login_events),
             "account_audit_logs": rows_to_dicts(audit_logs),
+            "wallet": dict(wallet) if wallet else {"balance": 0, "updated_at": ""},
+            "wallet_transfers": rows_to_dicts(wallet_transfers),
         }
         self.send_json_download(payload, f"white-market-data-{user['id']}.json")
 
@@ -3380,7 +3445,7 @@ class App(BaseHTTPRequestHandler):
                 for image_url in (row["image_url"], row["thumbnail_url"])
                 if image_url
             ]
-            write_account_log(conn, user["id"], "회원 탈퇴", "상품 비공개 및 계정 익명화", self.client_address[0])
+            write_account_log(conn, user["id"], "회원 탈퇴", "상품 비공개·계정 익명화·잔여 WM 포인트 소멸", self.client_address[0])
             conn.execute("UPDATE products SET is_deleted = 1, image_url = '', updated_at = ? WHERE seller_id = ?", (now(), user["id"]))
             conn.execute("DELETE FROM product_images WHERE product_id IN (SELECT id FROM products WHERE seller_id = ?)", (user["id"],))
             conn.execute("DELETE FROM favorites WHERE user_id = ?", (user["id"],))
@@ -3388,6 +3453,7 @@ class App(BaseHTTPRequestHandler):
             conn.execute("DELETE FROM keyword_alerts WHERE user_id = ?", (user["id"],))
             conn.execute("DELETE FROM notifications WHERE user_id = ?", (user["id"],))
             conn.execute("DELETE FROM password_reset_challenges WHERE user_id = ?", (user["id"],))
+            conn.execute("UPDATE wallets SET balance = 0, updated_at = ? WHERE user_id = ?", (now(), user["id"]))
             conn.execute("UPDATE login_events SET ip_address = '', user_agent = '', username_attempt = '' WHERE user_id = ?", (user["id"],))
             conn.execute(
                 """
@@ -4074,19 +4140,29 @@ class App(BaseHTTPRequestHandler):
             ).fetchone()
             if existing:
                 return self.redirect(f"/transactions?focus={existing['id']}")
+            accepted_offer = conn.execute(
+                """
+                SELECT proposed_price FROM chat_actions
+                WHERE product_id = ? AND buyer_id = ? AND seller_id = ?
+                  AND action_type = 'offer' AND status = 'accepted' AND proposed_price > 0
+                ORDER BY id DESC LIMIT 1
+                """,
+                (product_id, user["id"], product["seller_id"]),
+            ).fetchone()
+            agreed_price = accepted_offer["proposed_price"] if accepted_offer else product["price"]
             tx_id = conn.execute(
                 """
-                INSERT INTO transactions(product_id, seller_id, buyer_id, status, created_at, updated_at)
-                VALUES (?, ?, ?, '거래요청', ?, ?)
+                INSERT INTO transactions(product_id, seller_id, buyer_id, status, agreed_price, created_at, updated_at)
+                VALUES (?, ?, ?, '거래요청', ?, ?, ?)
                 """,
-                (product_id, product["seller_id"], user["id"], now(), now()),
+                (product_id, product["seller_id"], user["id"], agreed_price, now(), now()),
             ).lastrowid
             conn.execute(
                 """
                 INSERT INTO transaction_history(transaction_id, actor_id, from_status, to_status, details, created_at)
-                VALUES (?, ?, '', '거래요청', '구매자가 거래를 요청함', ?)
+                VALUES (?, ?, '', '거래요청', ?, ?)
                 """,
-                (tx_id, user["id"], now()),
+                (tx_id, user["id"], f"구매자가 거래를 요청함 · 거래 금액 {won(agreed_price)}", now()),
             )
             add_notification(
                 conn,
@@ -4106,12 +4182,17 @@ class App(BaseHTTPRequestHandler):
         with db() as conn:
             rows = conn.execute(
                 """
-                SELECT t.*, p.title, p.price, s.display_name AS seller, b.display_name AS buyer,
-                       ur.score AS my_rating_score, ur.review AS my_rating_review
+                SELECT t.*, p.title,
+                       COALESCE(NULLIF(t.agreed_price, 0), p.price) AS trade_price,
+                       s.display_name AS seller, b.display_name AS buyer,
+                       ur.score AS my_rating_score, ur.review AS my_rating_review,
+                       wt.amount AS payment_amount, wt.reference_code AS payment_reference,
+                       wt.created_at AS payment_at
                 FROM transactions t
                 JOIN products p ON p.id = t.product_id
                 JOIN users s ON s.id = t.seller_id
                 JOIN users b ON b.id = t.buyer_id
+                LEFT JOIN wallet_transfers wt ON wt.transaction_id = t.id
                 LEFT JOIN user_ratings ur
                   ON ur.reviewer_id = ? AND ur.context_type = 'transaction' AND ur.context_id = t.id
                 WHERE t.seller_id = ? OR t.buyer_id = ?
@@ -4123,9 +4204,154 @@ class App(BaseHTTPRequestHandler):
                 "SELECT transaction_id, item_key, checked FROM transaction_checklists WHERE user_id = ?",
                 (user["id"],),
             ).fetchall()
+            wallet = conn.execute("SELECT balance FROM wallets WHERE user_id = ?", (user["id"],)).fetchone()
+            transfers = conn.execute(
+                """
+                SELECT wt.*, p.title,
+                       sender.display_name AS sender_name,
+                       receiver.display_name AS receiver_name
+                FROM wallet_transfers wt
+                JOIN transactions t ON t.id = wt.transaction_id
+                JOIN products p ON p.id = t.product_id
+                JOIN users sender ON sender.id = wt.sender_id
+                JOIN users receiver ON receiver.id = wt.receiver_id
+                WHERE wt.sender_id = ? OR wt.receiver_id = ?
+                ORDER BY wt.id DESC LIMIT 20
+                """,
+                (user["id"], user["id"]),
+            ).fetchall()
         checklist_map = {(row["transaction_id"], row["item_key"]): bool(row["checked"]) for row in checklist_rows}
         items = "".join(transaction_row(t, user, self.csrf_input(user), checklist_map) for t in rows)
-        self.send_html(f'<section class="panel"><h1>거래 내역 조회</h1><div class="tx-list">{items or "<p>거래 내역이 없습니다.</p>"}</div></section>')
+        transfer_rows = ""
+        for transfer in transfers:
+            sent = transfer["sender_id"] == user["id"]
+            counterpart = transfer["receiver_name"] if sent else transfer["sender_name"]
+            transfer_rows += f"""
+            <tr>
+              <td>{esc(transfer["created_at"])}</td>
+              <td>{esc(transfer["title"])}</td>
+              <td>{'보냄' if sent else '받음'} · {esc(counterpart)}</td>
+              <td class="wallet-amount {'sent' if sent else 'received'}">{'-' if sent else '+'}{won(transfer["amount"])}</td>
+              <td><code>{esc(transfer["reference_code"])}</code></td>
+            </tr>
+            """
+        balance = wallet["balance"] if wallet else 0
+        self.send_html(
+            f"""
+            <section class="wallet-overview">
+              <div>
+                <span>내 WM 포인트</span>
+                <strong>{won(balance)}</strong>
+                <small>교육용 가상 포인트이며 실제 현금 가치가 없습니다.</small>
+              </div>
+              <details>
+                <summary>최근 송금 내역 {len(transfers)}건</summary>
+                <div class="table-panel">
+                  <table>
+                    <thead><tr><th>일시</th><th>상품</th><th>구분</th><th>금액</th><th>참조번호</th></tr></thead>
+                    <tbody>{transfer_rows or '<tr><td colspan="5">송금 내역이 없습니다.</td></tr>'}</tbody>
+                  </table>
+                </div>
+              </details>
+            </section>
+            <section class="panel"><h1>거래 내역 조회</h1><div class="tx-list">{items or "<p>거래 내역이 없습니다.</p>"}</div></section>
+            """
+        )
+
+    def transfer_transaction_payment(self, query, form):
+        user = self.require_user()
+        if not user:
+            return
+        enforce_rate_limit(
+            "wallet-transfer",
+            (f"ip:{self.client_address[0]}", f"user:{user['id']}"),
+            10,
+            10 * 60,
+        )
+        tx_id = int(form.get("id", "0") or "0")
+        with db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tx = conn.execute(
+                """
+                SELECT t.*, p.title,
+                       COALESCE(NULLIF(t.agreed_price, 0), p.price) AS trade_price
+                FROM transactions t
+                JOIN products p ON p.id = t.product_id
+                WHERE t.id = ? AND t.buyer_id = ?
+                """,
+                (tx_id, user["id"]),
+            ).fetchone()
+            if not tx:
+                raise ValueError("송금할 거래를 찾을 수 없습니다.")
+            if tx["status"] != "예약중":
+                raise ValueError("판매자가 승인한 예약중 거래에서만 송금할 수 있습니다.")
+            if conn.execute("SELECT 1 FROM wallet_transfers WHERE transaction_id = ?", (tx_id,)).fetchone():
+                raise ValueError("이미 송금이 완료된 거래입니다.")
+
+            amount = int(tx["trade_price"])
+            if not (0 < amount <= 100_000_000):
+                raise ValueError("거래 금액을 확인해주세요.")
+            timestamp = now()
+            conn.execute(
+                "INSERT OR IGNORE INTO wallets(user_id, balance, updated_at) VALUES (?, ?, ?)",
+                (tx["buyer_id"], INITIAL_DEMO_BALANCE, timestamp),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO wallets(user_id, balance, updated_at) VALUES (?, ?, ?)",
+                (tx["seller_id"], INITIAL_DEMO_BALANCE, timestamp),
+            )
+            deducted = conn.execute(
+                """
+                UPDATE wallets SET balance = balance - ?, updated_at = ?
+                WHERE user_id = ? AND balance >= ?
+                """,
+                (amount, timestamp, tx["buyer_id"], amount),
+            )
+            if deducted.rowcount != 1:
+                raise ValueError("WM 포인트 잔액이 부족합니다.")
+            conn.execute(
+                "UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ?",
+                (amount, timestamp, tx["seller_id"]),
+            )
+            reference_code = f"WM-{secrets.token_hex(6).upper()}"
+            conn.execute(
+                """
+                INSERT INTO wallet_transfers(reference_code, transaction_id, sender_id, receiver_id, amount, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (reference_code, tx_id, tx["buyer_id"], tx["seller_id"], amount, timestamp),
+            )
+            conn.execute(
+                """
+                INSERT INTO transaction_history(transaction_id, actor_id, from_status, to_status, details, created_at)
+                VALUES (?, ?, '예약중', '예약중', ?, ?)
+                """,
+                (tx_id, user["id"], f"WM 포인트 {won(amount)} 송금 완료 · {reference_code}", timestamp),
+            )
+            add_notification(
+                conn,
+                tx["seller_id"],
+                "payment",
+                "WM 포인트 입금",
+                f"{user['display_name']}님이 {tx['title']} 거래 대금 {won(amount)}을 보냈습니다.",
+                tx["product_id"],
+                f"/transactions?focus={tx_id}",
+            )
+            write_account_log(
+                conn,
+                tx["buyer_id"],
+                "WM 포인트 송금",
+                f"거래 #{tx_id} · {won(amount)} · {reference_code}",
+                self.client_address[0],
+            )
+            write_account_log(
+                conn,
+                tx["seller_id"],
+                "WM 포인트 수취",
+                f"거래 #{tx_id} · {won(amount)} · {reference_code}",
+                self.client_address[0],
+            )
+        self.redirect(f"/transactions?focus={tx_id}")
 
     def update_transaction_status(self, query, form):
         user = self.require_user()
@@ -4223,9 +4449,14 @@ class App(BaseHTTPRequestHandler):
         with db() as conn:
             tx = conn.execute(
                 """
-                SELECT t.*, p.title, s.display_name AS seller_name, b.display_name AS buyer_name
+                SELECT t.*, p.title,
+                       COALESCE(NULLIF(t.agreed_price, 0), p.price) AS trade_price,
+                       s.display_name AS seller_name, b.display_name AS buyer_name,
+                       wt.amount AS payment_amount, wt.reference_code AS payment_reference,
+                       wt.created_at AS payment_at
                 FROM transactions t JOIN products p ON p.id = t.product_id
                 JOIN users s ON s.id = t.seller_id JOIN users b ON b.id = t.buyer_id
+                LEFT JOIN wallet_transfers wt ON wt.transaction_id = t.id
                 WHERE t.id = ? AND (t.seller_id = ? OR t.buyer_id = ? OR ? = 1)
                 """,
                 (tx_id, user["id"], user["id"], user["is_admin"]),
@@ -4260,12 +4491,19 @@ class App(BaseHTTPRequestHandler):
             image_link = f'<a href="{esc(row["image_url"])}">사진 보기</a>' if row["image_url"] else ""
             message_rows += f"<tr><td>#{row['id']}</td><td>{esc(row['created_at'])}</td><td>{esc(row['sender_name'])}</td><td>{esc(row['body'] or '[사진]')} {image_link}</td></tr>"
         action_rows = "".join(f"<tr><td>{esc(row['created_at'])}</td><td>{esc(row['actor_name'])}</td><td>{esc(row['action_type'])}</td><td>{esc(row['status'])}</td><td>{esc(row['meeting_at'] or row['proposed_price'] or '-')}</td></tr>" for row in actions)
+        payment_rows = (
+            f"<tr><td>{esc(tx['payment_at'])}</td><td>{esc(tx['buyer_name'])}</td><td>{esc(tx['seller_name'])}</td>"
+            f"<td>{won(tx['payment_amount'])}</td><td><code>{esc(tx['payment_reference'])}</code></td></tr>"
+            if tx["payment_amount"]
+            else '<tr><td colspan="5">WM 포인트 송금 기록이 없습니다.</td></tr>'
+        )
         other_id = tx["seller_id"] if user["id"] == tx["buyer_id"] else tx["buyer_id"]
         self.send_html(
             f"""
             <section>
               <div class="section-title"><h1>거래 증빙 · {esc(tx['title'])}</h1><a class="button" href="/transactions?focus={tx_id}">거래 내역</a></div>
               <div class="evidence-actions"><a class="button danger" href="/report?type=user&id={other_id}&reason=사기 의심">사기 의심 신고</a><a class="button danger" href="/report?type=user&id={other_id}&reason=노쇼">노쇼 신고</a></div>
+              <section class="panel table-panel"><h2>WM 포인트 송금</h2><p class="muted">확정 거래 금액 {won(tx["trade_price"])} · 실제 현금 가치가 없는 교육용 기록</p><table><thead><tr><th>일시</th><th>보낸 사용자</th><th>받은 사용자</th><th>금액</th><th>참조번호</th></tr></thead><tbody>{payment_rows}</tbody></table></section>
               <section class="panel table-panel"><h2>거래 상태 이력</h2><table><thead><tr><th>일시</th><th>처리자</th><th>변경</th><th>상세</th></tr></thead><tbody>{history_rows}</tbody></table></section>
               <section class="panel table-panel"><h2>가격·약속 이력</h2><table><thead><tr><th>일시</th><th>제안자</th><th>종류</th><th>상태</th><th>내용</th></tr></thead><tbody>{action_rows or '<tr><td colspan="5">기록이 없습니다.</td></tr>'}</tbody></table></section>
               <section class="panel table-panel"><h2>거래 채팅</h2><table><thead><tr><th>ID</th><th>일시</th><th>작성자</th><th>내용</th></tr></thead><tbody>{message_rows or '<tr><td colspan="4">기록이 없습니다.</td></tr>'}</tbody></table></section>
@@ -4877,6 +5115,13 @@ def transaction_row(t, user, csrf, checklist_map=None):
     is_buyer = user["id"] == t["buyer_id"]
     is_seller = user["id"] == t["seller_id"]
     role = "구매자" if is_buyer else "판매자"
+    payment_amount = t["payment_amount"]
+    payment_summary = ""
+    if payment_amount:
+        payment_summary = (
+            f'<p class="payment-complete"><strong>WM 포인트 {won(payment_amount)} 송금 완료</strong>'
+            f' · {esc(t["payment_at"])} · <code>{esc(t["payment_reference"])}</code></p>'
+        )
     action_form = ""
     if is_seller and t["status"] == "거래요청":
         action_form = f"""
@@ -4890,19 +5135,32 @@ def transaction_row(t, user, csrf, checklist_map=None):
         </div>
         """
     elif is_buyer and t["status"] == "예약중":
+        payment_action = ""
+        if not payment_amount:
+            payment_action = f"""
+            <form method="post" action="/transaction/payment" class="inline">
+              {csrf}<input type="hidden" name="id" value="{t["id"]}">
+              <button class="primary">WM 포인트 {won(t["trade_price"])} 송금</button>
+            </form>
+            """
         action_form = f"""
         <div class="tx-actions">
+          {payment_action}
           <form method="post" action="/transaction/status" class="inline">
             {csrf}<input type="hidden" name="id" value="{t["id"]}">
-            <button class="primary" name="action" value="complete">거래 완료</button>
+            <button name="action" value="complete">거래 완료</button>
           </form>
-          <small>상품을 받은 뒤 거래 완료를 눌러주세요.</small>
+          <small>{'송금이 완료되었습니다. ' if payment_amount else '가상 포인트 송금은 거래당 한 번만 가능합니다. '}상품을 받은 뒤 거래 완료를 눌러주세요.</small>
         </div>
         """
     elif is_buyer and t["status"] == "거래요청":
         action_form = '<p class="muted">판매자가 거래 요청을 확인하는 중입니다.</p>'
     elif is_seller and t["status"] == "예약중":
-        action_form = '<p class="muted">구매자의 거래 완료 확인을 기다리고 있습니다.</p>'
+        action_form = (
+            '<p class="payment-complete">거래 대금을 받았습니다. 구매자의 거래 완료 확인을 기다리고 있습니다.</p>'
+            if payment_amount
+            else '<p class="muted">구매자의 송금 또는 거래 완료 확인을 기다리고 있습니다.</p>'
+        )
     review_form = ""
     if t["status"] == "거래완료":
         counterpart = t["seller"] if is_buyer else t["buyer"]
@@ -4932,8 +5190,9 @@ def transaction_row(t, user, csrf, checklist_map=None):
       <div>
         <h2>{esc(t["title"])}</h2>
         <p><span class="status-badge">{esc(t["status"])}</span> · 내 역할: {role}</p>
-        <p>{won(t["price"])} · 판매자 {esc(t["seller"])} · 구매자 {esc(t["buyer"])}</p>
+        <p>{won(t["trade_price"])} · 판매자 {esc(t["seller"])} · 구매자 {esc(t["buyer"])}</p>
         <p class="muted">생성 {esc(t["created_at"])} · 수정 {esc(t["updated_at"])}</p>
+        {payment_summary}
       </div>
       {action_form}
       <details class="safety-checklist"><summary>거래 전 안전 체크리스트</summary>{checklist}</details>

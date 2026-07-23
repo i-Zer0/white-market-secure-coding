@@ -1297,6 +1297,65 @@ small {
   gap: 12px;
 }
 
+.wallet-overview {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.38fr) minmax(0, 0.62fr);
+  gap: 28px;
+  align-items: start;
+  margin-bottom: 20px;
+  padding: 20px 4px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.wallet-overview > div,
+.wallet-compact {
+  display: grid;
+  gap: 5px;
+}
+
+.wallet-overview strong,
+.wallet-compact strong {
+  color: var(--accent-dark);
+  font-size: 25px;
+}
+
+.wallet-overview small,
+.wallet-compact small {
+  color: var(--muted);
+}
+
+.wallet-overview summary {
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.wallet-overview .table-panel {
+  margin-top: 12px;
+}
+
+.wallet-compact {
+  margin-bottom: 20px;
+}
+
+.wallet-amount {
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.wallet-amount.sent {
+  color: #b04343;
+}
+
+.wallet-amount.received,
+.payment-complete {
+  color: var(--accent-dark);
+}
+
+.payment-complete {
+  overflow-wrap: anywhere;
+}
+
 .user-card,
 .tx {
   display: flex;
@@ -1928,7 +1987,8 @@ th {
   .notice-card,
   .split,
   .profile,
-  .detail {
+  .detail,
+  .wallet-overview {
     display: flex;
     flex-direction: column;
     align-items: stretch;
