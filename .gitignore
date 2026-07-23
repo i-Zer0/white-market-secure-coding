@@ -1,5 +1,6 @@
 market.db
 __pycache__/
+.venv/
 *.pyc
 *.log
 .env
