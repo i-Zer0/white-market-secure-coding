@@ -19,7 +19,7 @@ GitHub: https://github.com/i-Zer0/white-market-secure-coding
 - 개인정보: 내 데이터 JSON 다운로드, 비밀번호와 2단계 인증 재확인 탈퇴, 상품 비공개, 계정 익명화, 탈퇴 감사 기록
 - 관리자 통계: 회원·상품·거래·신고 현황, 미처리 신고 강조, 최근 14일 증가 추이, 정지·탈퇴 기록
 - 운영: DB 일일 자동 백업·관리자 수동 백업과 복원, 오류 번호별 로그와 처리 상태, 오래된 읽은 알림 정리, 검색·채팅 DB 인덱스
-- 자동 검사: `unittest` 기능 검사와 GitHub Actions 컴파일·테스트·Bandit·의존성 검토
+- 자동 검사: GitHub Actions의 Python 컴파일·Bandit 정적 보안 검사·PR 의존성 검토
 - 홈 화면: 통합 상품 검색, 카테고리 바로가기, WhiteHat School·BoB 교육 광고 슬라이드
 
 ## 보안 반영 사항
@@ -123,4 +123,3 @@ $env:WHITE_MARKET_HTTPS="1"
 ## 초기 관리자 계정
 
 첫 실행 시 아이디 `admin`과 `WHITE_MARKET_ADMIN_PASSWORD` 값으로 관리자 계정을 만듭니다. 기본 비밀번호는 코드에 존재하지 않으며 최초 로그인 직후 반드시 새 비밀번호로 변경해야 합니다.
-
