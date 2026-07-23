@@ -12,3 +12,4 @@ backups/*.wmbak
 admin-initial-password.txt
 local-security-env.ps1
 tmp/
+output/pdf/*.pdf
