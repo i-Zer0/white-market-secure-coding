@@ -1823,6 +1823,91 @@ small {
   background: #f5f5f5;
 }
 
+.chat-payment-panel {
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.chat-payment-heading,
+.chat-payment-panel.complete {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.chat-payment-heading h3,
+.chat-payment-heading p,
+.chat-payment-panel.complete strong,
+.chat-payment-panel.complete small,
+.chat-payment-panel.waiting strong,
+.chat-payment-panel.waiting small {
+  display: block;
+  margin: 0;
+}
+
+.payment-recipient {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.chat-payment-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.chat-payment-summary > div {
+  display: grid;
+  gap: 3px;
+  padding: 11px 13px;
+}
+
+.chat-payment-summary > div + div {
+  border-left: 1px solid var(--line);
+}
+
+.chat-payment-summary dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chat-payment-summary dd {
+  margin: 0;
+  color: var(--ink);
+  font-weight: 900;
+}
+
+.chat-payment-panel form,
+.chat-payment-panel form button {
+  width: 100%;
+}
+
+.chat-payment-panel > small,
+.chat-payment-panel.complete small,
+.chat-payment-panel.waiting small {
+  color: var(--muted);
+}
+
+.chat-payment-panel.complete {
+  background: #f2faee;
+}
+
+.chat-payment-panel.complete > div {
+  display: grid;
+  gap: 4px;
+}
+
+.chat-payment-panel.waiting {
+  background: #fafbf9;
+}
+
 .chat-action-tools {
   display: flex;
   gap: 8px;
@@ -2342,6 +2427,21 @@ th {
   .chat-transaction-control {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .chat-payment-heading,
+  .chat-payment-panel.complete {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .chat-payment-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-payment-summary > div + div {
+    border-top: 1px solid var(--line);
+    border-left: 0;
   }
 
   .chat-action-card {

@@ -3613,6 +3613,11 @@ class App(BaseHTTPRequestHandler):
             chat_rating = None
             product_context = None
             chat_transaction = None
+            wallet_balance = conn.execute(
+                "SELECT balance FROM wallets WHERE user_id = ?",
+                (user["id"],),
+            ).fetchone()
+            wallet_balance = wallet_balance["balance"] if wallet_balance else 0
             chat_actions = []
             action_history = {}
             if peer_id:
@@ -3682,11 +3687,16 @@ class App(BaseHTTPRequestHandler):
                 if product_context:
                     chat_transaction = conn.execute(
                         """
-                        SELECT * FROM transactions
-                        WHERE product_id = ?
-                          AND ((buyer_id = ? AND seller_id = ?) OR (buyer_id = ? AND seller_id = ?))
-                          AND status IN ('예약중', '거래완료')
-                        ORDER BY id DESC LIMIT 1
+                        SELECT t.*, COALESCE(NULLIF(t.agreed_price, 0), p.price) AS trade_price,
+                               wt.amount AS payment_amount, wt.reference_code AS payment_reference,
+                               wt.created_at AS payment_at
+                        FROM transactions t
+                        JOIN products p ON p.id = t.product_id
+                        LEFT JOIN wallet_transfers wt ON wt.transaction_id = t.id
+                        WHERE t.product_id = ?
+                          AND ((t.buyer_id = ? AND t.seller_id = ?) OR (t.buyer_id = ? AND t.seller_id = ?))
+                          AND t.status IN ('예약중', '거래완료')
+                        ORDER BY t.id DESC LIMIT 1
                         """,
                         (product_id, user["id"], peer_id, peer_id, user["id"]),
                     ).fetchone()
@@ -3786,38 +3796,85 @@ class App(BaseHTTPRequestHandler):
         chat_action_panel = ""
         if product_context and peer:
             transaction_control = ""
+            payment_panel = ""
             if chat_transaction:
+                if chat_transaction["payment_amount"]:
+                    payment_panel = f"""
+                    <div class="chat-payment-panel complete">
+                      <div>
+                        <span class="status-badge">송금 완료</span>
+                        <strong>WM 포인트 {won(chat_transaction["payment_amount"])}</strong>
+                        <small>{esc(chat_transaction["payment_at"])} · 참조번호 <code>{esc(chat_transaction["payment_reference"])}</code></small>
+                      </div>
+                      <a class="button" href="/transaction/evidence?id={chat_transaction["id"]}">송금 기록</a>
+                    </div>
+                    """
                 if chat_transaction["status"] == "예약중":
                     seller_controls = ""
                     if user["id"] == product_context["seller_id"]:
+                        payment_received = bool(chat_transaction["payment_amount"])
                         seller_controls = f"""
                         <div class="inline">
                           <form method="post" action="/transaction/status" class="inline">
                             {self.csrf_input(user)}
                             <input type="hidden" name="id" value="{chat_transaction["id"]}">
                             <input type="hidden" name="return_to_chat" value="1">
-                            <button name="action" value="reopen">판매중으로 변경</button>
+                            <button name="action" value="reopen" {"disabled" if payment_received else ""}>판매중으로 변경</button>
                           </form>
                           <form method="post" action="/transaction/status" class="inline">
                             {self.csrf_input(user)}
                             <input type="hidden" name="id" value="{chat_transaction["id"]}">
                             <input type="hidden" name="return_to_chat" value="1">
-                            <button class="primary" name="action" value="complete">거래 완료</button>
+                            <button class="primary" name="action" value="complete" {"disabled" if not payment_received else ""}>거래 완료</button>
                           </form>
                         </div>
                         """
                     transaction_control = f"""
                     <div class="chat-transaction-control">
-                      <span><strong>거래 예약중</strong><small>{'판매중으로 되돌리거나 거래 완료로 변경할 수 있습니다.' if seller_controls else '판매자가 거래 상태를 관리하고 있습니다.'}</small></span>
+                      <span><strong>거래 예약중</strong><small>{'송금이 완료되어 판매중으로 되돌릴 수 없습니다.' if seller_controls and chat_transaction["payment_amount"] else '구매자 송금 후 거래 완료로 변경할 수 있습니다.' if seller_controls else '판매자가 거래 상태를 관리하고 있습니다.'}</small></span>
                       {seller_controls}
                     </div>
                     """
+                    if not chat_transaction["payment_amount"] and user["id"] == chat_transaction["buyer_id"]:
+                        insufficient = wallet_balance < chat_transaction["trade_price"]
+                        payment_panel = f"""
+                        <div class="chat-payment-panel">
+                          <div class="chat-payment-heading">
+                            <div><p class="eyebrow">구매자 결제</p><h3>거래 대금 송금</h3></div>
+                            <span class="payment-recipient">{esc(peer["display_name"])}님에게</span>
+                          </div>
+                          <dl class="chat-payment-summary">
+                            <div><dt>확정 금액</dt><dd>{won(chat_transaction["trade_price"])}</dd></div>
+                            <div><dt>보유 포인트</dt><dd>{won(wallet_balance)}</dd></div>
+                          </dl>
+                          {f'<p class="form-error">보유 포인트가 부족합니다.</p>' if insufficient else ''}
+                          <form method="post" action="/transaction/payment">
+                            {self.csrf_input(user)}
+                            <input type="hidden" name="id" value="{chat_transaction["id"]}">
+                            <input type="hidden" name="return_to_chat" value="1">
+                            <button class="primary" {"disabled" if insufficient else ""}>WM 포인트 {won(chat_transaction["trade_price"])} 송금</button>
+                          </form>
+                          <small>교육용 가상 포인트이며 거래당 한 번만 송금할 수 있습니다.</small>
+                        </div>
+                        """
+                    elif not chat_transaction["payment_amount"]:
+                        payment_panel = f"""
+                        <div class="chat-payment-panel waiting">
+                          <div><p class="eyebrow">거래 대금</p><strong>구매자 송금 대기</strong><small>확정 금액 {won(chat_transaction["trade_price"])}</small></div>
+                        </div>
+                        """
                 else:
                     transaction_control = """
                     <div class="chat-transaction-control complete">
                       <span><strong>거래 완료</strong><small>완료된 거래입니다.</small></span>
                     </div>
                     """
+                    if not chat_transaction["payment_amount"]:
+                        payment_panel = """
+                        <div class="chat-payment-panel waiting">
+                          <div><p class="eyebrow">거래 대금</p><strong>송금 기록 없음</strong><small>송금 기능 적용 전에 완료된 거래입니다.</small></div>
+                        </div>
+                        """
             elif user["id"] == product_context["seller_id"] and product_context["status"] == "판매중" and messages:
                 transaction_control = f"""
                 <div class="chat-transaction-control">
@@ -3859,6 +3916,7 @@ class App(BaseHTTPRequestHandler):
             chat_action_panel = f"""
             <section class="chat-action-panel">
               {transaction_control}
+              {payment_panel}
               {f'<div class="chat-action-tools">{buyer_offer_form}</div>' if buyer_offer_form else ''}
               {f'<details class="chat-action-history"><summary>가격 제안 기록 {len(chat_actions)}건</summary><div class="chat-action-list">{action_cards}</div></details>' if chat_actions else ''}
             </section>
@@ -4421,6 +4479,19 @@ class App(BaseHTTPRequestHandler):
                 """,
                 (tx_id, user["id"], f"WM 포인트 {won(amount)} 송금 완료 · {reference_code}", timestamp),
             )
+            conn.execute(
+                """
+                INSERT INTO messages(sender_id, receiver_id, product_id, body, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    tx["buyer_id"],
+                    tx["seller_id"],
+                    tx["product_id"],
+                    f"WM 포인트 {won(amount)} 송금을 완료했습니다. 참조번호 {reference_code}",
+                    timestamp,
+                ),
+            )
             add_notification(
                 conn,
                 tx["seller_id"],
@@ -4428,7 +4499,7 @@ class App(BaseHTTPRequestHandler):
                 "WM 포인트 입금",
                 f"{user['display_name']}님이 {tx['title']} 거래 대금 {won(amount)}을 보냈습니다.",
                 tx["product_id"],
-                f"/transactions?focus={tx_id}",
+                f"/chat?user={tx['buyer_id']}&product={tx['product_id']}",
             )
             write_account_log(
                 conn,
@@ -4444,6 +4515,8 @@ class App(BaseHTTPRequestHandler):
                 f"거래 #{tx_id} · {won(amount)} · {reference_code}",
                 self.client_address[0],
             )
+        if form.get("return_to_chat") == "1":
+            return self.redirect(f"/chat?user={tx['seller_id']}&product={tx['product_id']}")
         self.redirect(f"/transactions?focus={tx_id}")
 
     def update_transaction_status(self, query, form):
@@ -4515,6 +4588,11 @@ class App(BaseHTTPRequestHandler):
                 )
                 new_status = "예약취소"
             elif action == "complete" and user["id"] == tx["seller_id"] and tx["status"] == "예약중":
+                if not conn.execute(
+                    "SELECT 1 FROM wallet_transfers WHERE transaction_id = ?",
+                    (tx_id,),
+                ).fetchone():
+                    raise ValueError("구매자의 송금이 완료된 후 거래 완료로 변경할 수 있습니다.")
                 timestamp = now()
                 conn.execute("UPDATE transactions SET status = '거래완료', updated_at = ? WHERE id = ?", (timestamp, tx_id))
                 conn.execute("UPDATE products SET status = '거래완료', updated_at = ? WHERE id = ?", (timestamp, tx["product_id"]))
@@ -5287,9 +5365,9 @@ def transaction_row(t, user, csrf, checklist_map=None):
               <form method="post" action="/transaction/status" class="inline">
                 {csrf}<input type="hidden" name="id" value="{t["id"]}">
                 <button name="action" value="reopen" {'disabled' if payment_amount else ''}>판매중으로 변경</button>
-                <button class="primary" name="action" value="complete">거래 완료</button>
+                <button class="primary" name="action" value="complete" {'disabled' if not payment_amount else ''}>거래 완료</button>
               </form>
-              <small>{'송금이 완료되어 판매중으로 되돌릴 수 없습니다.' if payment_amount else '거래가 취소되면 판매중으로 되돌릴 수 있습니다.'}</small>
+              <small>{'송금이 완료되어 판매중으로 되돌릴 수 없습니다.' if payment_amount else '구매자 송금 후 거래 완료로 변경할 수 있습니다.'}</small>
             </div>
             """
     elif is_buyer and t["status"] == "거래요청":
