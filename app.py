@@ -2014,37 +2014,27 @@ class App(BaseHTTPRequestHandler):
                     "INSERT INTO login_events(user_id, username_attempt, success, ip_address, user_agent, created_at) VALUES (?, ?, 0, ?, ?, ?)",
                     (user["id"], username[:50], ip_address, user_agent, now()),
                 )
-                message = "로그인 실패가 5회 누적되었습니다. 다음 로그인부터 휴대전화 본인인증이 필요합니다." if locked else "아이디 또는 비밀번호가 올바르지 않습니다."
-                return self.login_page({"error": message}, form)
+                if locked:
+                    return self.password_reset_page(
+                        {
+                            "locked": "1",
+                            "username": username,
+                            "phone_hint": mask_phone(user["phone"]),
+                        },
+                        form,
+                    )
+                return self.login_page({"error": "아이디 또는 비밀번호가 올바르지 않습니다."}, form)
             if user["password_reset_required"]:
                 if not user["phone"]:
-                    return self.login_page({"error": "등록된 휴대전화가 없어 추가 본인인증을 진행할 수 없습니다. 관리자에게 문의하세요."}, form)
-                current_time = int(time.time())
-                conn.execute(
-                    "DELETE FROM login_verification_challenges WHERE user_id = ? OR expires_at < ? OR used = 1",
-                    (user["id"], current_time),
+                    return self.login_page({"error": "등록된 휴대전화가 없어 잠금을 해제할 수 없습니다. 관리자에게 문의하세요."}, form)
+                return self.password_reset_page(
+                    {
+                        "locked": "1",
+                        "username": username,
+                        "phone_hint": mask_phone(user["phone"]),
+                    },
+                    form,
                 )
-                challenge_id = secrets.token_urlsafe(24)
-                code = f"{secrets.randbelow(1_000_000):06d}"
-                conn.execute(
-                    """
-                    INSERT INTO login_verification_challenges(
-                        id, user_id, code_hash, created_at, expires_at, ip_address, user_agent
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        challenge_id,
-                        user["id"],
-                        reset_code_digest(challenge_id, code),
-                        current_time,
-                        current_time + PASSWORD_RESET_SECONDS,
-                        ip_address,
-                        user_agent,
-                    ),
-                )
-                dev_code = send_sms_verification(user["phone"], code, "로그인 추가 본인인증")
-                write_account_log(conn, user["id"], "조건부 로그인 인증번호 발급", "로그인 실패 5회 누적", ip_address)
-                return self.conditional_login_page(challenge_id, user, dev_code)
             previous_success = conn.execute(
                 "SELECT ip_address, user_agent FROM login_events WHERE user_id = ? AND success = 1 ORDER BY id DESC LIMIT 1",
                 (user["id"],),
@@ -2183,17 +2173,19 @@ class App(BaseHTTPRequestHandler):
     def password_reset_page(self, query, form):
         username = esc(query.get("username", form.get("username", "")))
         error = esc(query.get("error", ""))
+        locked = query.get("locked") == "1"
+        phone_hint = esc(query.get("phone_hint", ""))
         self.send_html(
             f"""
             <section class="panel narrow">
-              <h1>비밀번호 재설정</h1>
-              <p class="muted">가입할 때 등록한 휴대전화 번호로 본인인증을 진행합니다.</p>
+              <h1>{'계정 잠금 해제' if locked else '비밀번호 재설정'}</h1>
+              {f'<div class="notice"><strong>로그인 5회 실패로 계정이 잠겼습니다.</strong><p>{phone_hint}로 등록된 휴대전화 번호를 확인한 뒤 새 비밀번호를 설정하세요.</p></div>' if locked else '<p class="muted">가입할 때 등록한 휴대전화 번호로 본인인증을 진행합니다.</p>'}
               {f'<p class="form-error" role="alert">{error}</p>' if error else ''}
               <form method="post" action="/password-reset/request">
                 {self.csrf_input()}
                 <label>아이디<input name="username" value="{username}" required autocomplete="username"></label>
                 <label>등록 휴대전화 번호<input name="phone" required maxlength="13" inputmode="tel" autocomplete="tel" placeholder="010-1234-5678"></label>
-                <button class="primary">인증번호 받기</button>
+                <button class="primary">{'본인인증 시작' if locked else '인증번호 받기'}</button>
               </form>
               <p class="login-help"><a href="/login">로그인으로 돌아가기</a></p>
             </section>
@@ -3370,8 +3362,8 @@ class App(BaseHTTPRequestHandler):
               {settings_navigation("security")}
               <div class="panel security-grid">
                 <div class="security-setting">
-                  <h2>조건부 추가 본인인증</h2>
-                  <p>평소에는 아이디와 비밀번호로 로그인합니다. 비밀번호 입력을 5회 이상 실패하면 등록된 휴대전화 인증이 자동으로 적용됩니다.</p>
+                  <h2>로그인 실패 계정 잠금</h2>
+                  <p>비밀번호 입력을 5회 실패하면 계정을 잠그고 등록된 휴대전화 본인인증과 새 비밀번호 설정을 요구합니다.</p>
                 </div>
                 <div class="security-setting">
                   <h2>비밀번호</h2>
