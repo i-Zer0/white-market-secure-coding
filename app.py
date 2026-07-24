@@ -3687,7 +3687,7 @@ class App(BaseHTTPRequestHandler):
                 action_title = f"가격 제안 {won(chat_action['proposed_price'])}"
                 action_detail = f"{esc(chat_action['actor_name'])}님이 희망 가격을 제안했습니다."
             else:
-                action_title = f"거래 약속 · {esc(chat_action['meeting_at'])}"
+                action_title = "거래 약속"
                 action_detail = f"{esc(chat_action['meeting_place'])} · {esc(chat_action['actor_name'])}님 제안"
             response_buttons = ""
             if chat_action["status"] == "pending" and chat_action["actor_id"] != user["id"]:
@@ -3703,12 +3703,11 @@ class App(BaseHTTPRequestHandler):
             if chat_action["action_type"] == "appointment" and chat_action["status"] in {"pending", "accepted"}:
                 reschedule_form = f"""
                 <details>
-                  <summary>시간·장소 변경 제안</summary>
+                  <summary>장소 변경 제안</summary>
                   <form method="post" action="/chat/appointment/reschedule">
                     {self.csrf_input(user)}
                     <input type="hidden" name="id" value="{chat_action["id"]}">
                     <label>새 장소<input name="meeting_place" value="{esc(chat_action["meeting_place"])}" maxlength="100" required></label>
-                    <label>새 날짜와 시간<input name="meeting_at" type="datetime-local" required></label>
                     <button>변경 제안</button>
                   </form>
                 </details>
@@ -3773,7 +3772,6 @@ class App(BaseHTTPRequestHandler):
                     <input type="hidden" name="product_id" value="{product_id}">
                     <input type="hidden" name="peer_id" value="{peer_id}">
                     <label>장소<input name="meeting_place" maxlength="100" required placeholder="예: 홍대입구역 2번 출구"></label>
-                    <label>날짜와 시간<input name="meeting_at" type="datetime-local" required></label>
                     <button class="primary">약속 제안</button>
                   </form>
                 </details>
@@ -3999,16 +3997,8 @@ class App(BaseHTTPRequestHandler):
         product_id = int(form.get("product_id", "0") or "0")
         peer_id = int(form.get("peer_id", "0") or "0")
         meeting_place = form.get("meeting_place", "").strip()
-        meeting_at_input = form.get("meeting_at", "").strip()
         if not (2 <= len(meeting_place) <= 100):
             raise ValueError("거래 장소를 2-100자로 입력해주세요.")
-        try:
-            meeting_time = datetime.strptime(meeting_at_input, "%Y-%m-%dT%H:%M")
-        except ValueError:
-            raise ValueError("거래 날짜와 시간을 확인해주세요.")
-        if meeting_time < datetime.now() - timedelta(minutes=1) or meeting_time > datetime.now() + timedelta(days=365):
-            raise ValueError("거래 약속은 현재부터 1년 이내로 정해주세요.")
-        meeting_at = meeting_time.strftime("%Y-%m-%d %H:%M")
         with db() as conn:
             conn.execute("BEGIN IMMEDIATE")
             product = conn.execute("SELECT * FROM products WHERE id = ? AND is_deleted = 0", (product_id,)).fetchone()
@@ -4018,19 +4008,19 @@ class App(BaseHTTPRequestHandler):
             buyer_id = peer_id if user["id"] == seller_id else user["id"]
             action_id = conn.execute(
                 """
-                INSERT INTO chat_actions(product_id, buyer_id, seller_id, actor_id, action_type, meeting_place, meeting_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'appointment', ?, ?, ?, ?)
+                INSERT INTO chat_actions(product_id, buyer_id, seller_id, actor_id, action_type, meeting_place, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'appointment', ?, ?, ?)
                 """,
-                (product_id, buyer_id, seller_id, user["id"], meeting_place, meeting_at, now(), now()),
+                (product_id, buyer_id, seller_id, user["id"], meeting_place, now(), now()),
             ).lastrowid
-            details = f"{meeting_at} · {meeting_place} 약속 제안"
+            details = f"{meeting_place} 약속 제안"
             conn.execute(
                 "INSERT INTO chat_action_history(action_id, actor_id, event_type, to_status, details, created_at) VALUES (?, ?, 'created', 'pending', ?, ?)",
                 (action_id, user["id"], details, now()),
             )
             conn.execute(
                 "INSERT INTO messages(sender_id, receiver_id, product_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user["id"], peer_id, product_id, f"거래 약속을 제안했습니다: {meeting_at}, {meeting_place}", now()),
+                (user["id"], peer_id, product_id, f"거래 약속 장소를 제안했습니다: {meeting_place}", now()),
             )
             add_notification(conn, peer_id, "appointment", "새 거래 약속", details, product_id, f"/chat?user={user['id']}&product={product_id}")
         self.redirect(f"/chat?user={peer_id}&product={product_id}")
@@ -4041,16 +4031,8 @@ class App(BaseHTTPRequestHandler):
             return
         action_id = int(form.get("id", "0") or "0")
         meeting_place = form.get("meeting_place", "").strip()
-        meeting_at_input = form.get("meeting_at", "").strip()
         if not (2 <= len(meeting_place) <= 100):
             raise ValueError("거래 장소를 2-100자로 입력해주세요.")
-        try:
-            meeting_time = datetime.strptime(meeting_at_input, "%Y-%m-%dT%H:%M")
-        except ValueError:
-            raise ValueError("거래 날짜와 시간을 확인해주세요.")
-        if meeting_time < datetime.now() - timedelta(minutes=1) or meeting_time > datetime.now() + timedelta(days=365):
-            raise ValueError("거래 약속은 현재부터 1년 이내로 정해주세요.")
-        meeting_at = meeting_time.strftime("%Y-%m-%d %H:%M")
         with db() as conn:
             conn.execute("BEGIN IMMEDIATE")
             previous = conn.execute(
@@ -4068,16 +4050,16 @@ class App(BaseHTTPRequestHandler):
                 """
                 INSERT INTO chat_actions(
                     product_id, buyer_id, seller_id, actor_id, action_type, meeting_place,
-                    meeting_at, supersedes_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'appointment', ?, ?, ?, ?, ?)
+                    supersedes_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'appointment', ?, ?, ?, ?)
                 """,
                 (
                     previous["product_id"], previous["buyer_id"], previous["seller_id"], user["id"],
-                    meeting_place, meeting_at, action_id, now(), now(),
+                    meeting_place, action_id, now(), now(),
                 ),
             ).lastrowid
             conn.execute("UPDATE chat_actions SET status = 'superseded', updated_at = ? WHERE id = ?", (now(), action_id))
-            details = f"{previous['meeting_at']} · {previous['meeting_place']} → {meeting_at} · {meeting_place}"
+            details = f"{previous['meeting_place']} → {meeting_place}"
             conn.execute(
                 """
                 INSERT INTO chat_action_history(action_id, actor_id, event_type, from_status, to_status, details, created_at)
@@ -4087,11 +4069,11 @@ class App(BaseHTTPRequestHandler):
             )
             conn.execute(
                 "INSERT INTO chat_action_history(action_id, actor_id, event_type, to_status, details, created_at) VALUES (?, ?, 'created', 'pending', ?, ?)",
-                (new_id, user["id"], f"약속 변경 제안: {meeting_at} · {meeting_place}", now()),
+                (new_id, user["id"], f"약속 장소 변경 제안: {meeting_place}", now()),
             )
             conn.execute(
                 "INSERT INTO messages(sender_id, receiver_id, product_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user["id"], peer_id, previous["product_id"], f"거래 약속 변경을 제안했습니다: {meeting_at}, {meeting_place}", now()),
+                (user["id"], peer_id, previous["product_id"], f"거래 약속 장소 변경을 제안했습니다: {meeting_place}", now()),
             )
             add_notification(conn, peer_id, "appointment", "거래 약속 변경 제안", details, previous["product_id"], f"/chat?user={user['id']}&product={previous['product_id']}")
         self.redirect(f"/chat?user={peer_id}&product={previous['product_id']}")
@@ -4186,7 +4168,7 @@ class App(BaseHTTPRequestHandler):
                 tx_id,
                 actor_id,
                 from_status,
-                f"거래 약속 확정 · {action['meeting_at']} · {action['meeting_place']}",
+                f"거래 약속 확정 · {action['meeting_place']}",
                 timestamp,
             ),
         )
@@ -4665,7 +4647,7 @@ class App(BaseHTTPRequestHandler):
         for row in messages:
             image_link = f'<a href="{esc(row["image_url"])}">사진 보기</a>' if row["image_url"] else ""
             message_rows += f"<tr><td>#{row['id']}</td><td>{esc(row['created_at'])}</td><td>{esc(row['sender_name'])}</td><td>{esc(row['body'] or '[사진]')} {image_link}</td></tr>"
-        action_rows = "".join(f"<tr><td>{esc(row['created_at'])}</td><td>{esc(row['actor_name'])}</td><td>{esc(row['action_type'])}</td><td>{esc(row['status'])}</td><td>{esc(row['meeting_at'] or row['proposed_price'] or '-')}</td></tr>" for row in actions)
+        action_rows = "".join(f"<tr><td>{esc(row['created_at'])}</td><td>{esc(row['actor_name'])}</td><td>{esc(row['action_type'])}</td><td>{esc(row['status'])}</td><td>{esc(row['meeting_place'] or row['proposed_price'] or '-')}</td></tr>" for row in actions)
         payment_rows = (
             f"<tr><td>{esc(tx['payment_at'])}</td><td>{esc(tx['buyer_name'])}</td><td>{esc(tx['seller_name'])}</td>"
             f"<td>{won(tx['payment_amount'])}</td><td><code>{esc(tx['payment_reference'])}</code></td></tr>"
