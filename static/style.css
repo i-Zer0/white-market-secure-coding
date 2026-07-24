@@ -1126,35 +1126,9 @@ small {
   margin: 2px 0 4px;
 }
 
-.login-options > a,
-.login-two-factor summary {
+.login-options > a {
   color: var(--accent-dark);
   font-weight: 700;
-}
-
-.login-two-factor {
-  max-width: 100%;
-}
-
-.login-two-factor:not([open]) > :not(summary) {
-  display: none;
-}
-
-.login-two-factor summary {
-  cursor: pointer;
-}
-
-.login-two-factor[open] {
-  flex-basis: 100%;
-}
-
-.login-two-factor[open] summary {
-  margin-bottom: 10px;
-  text-align: center;
-}
-
-.login-two-factor label {
-  text-align: left;
 }
 
 .dev-code {
@@ -1922,16 +1896,6 @@ small {
   margin: 8px 0;
 }
 
-.totp-secret {
-  padding: 12px;
-  overflow-wrap: anywhere;
-  border: 1px dashed #aab6ad;
-  border-radius: 7px;
-  background: #f5f8f4;
-  font-size: 18px;
-  text-align: center;
-}
-
 .ua-text {
   display: block;
   max-width: 320px;
@@ -2350,21 +2314,6 @@ th {
   position: absolute;
   right: -8px;
   top: -8px;
-}
-
-.recovery-codes ul {
-  display: grid;
-  gap: 8px;
-  grid-template-columns: repeat(2, 1fr);
-  list-style: none;
-  padding: 0;
-}
-
-.recovery-codes code {
-  background: #f2f6f0;
-  display: block;
-  padding: 10px;
-  text-align: center;
 }
 
 .category-filter {

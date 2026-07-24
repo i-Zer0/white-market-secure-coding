@@ -320,20 +320,6 @@ def save_chat_image(data_url):
     return f"/static/chat_uploads/{filename}"
 
 
-def recovery_code_hash(code):
-    return hashlib.sha256(f"white-market-recovery:{code.strip().upper()}".encode("utf-8")).hexdigest()
-
-
-def issue_recovery_codes(conn, user_id, count=8):
-    conn.execute("DELETE FROM user_recovery_codes WHERE user_id = ?", (user_id,))
-    codes = [f"{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}" for _ in range(count)]
-    conn.executemany(
-        "INSERT INTO user_recovery_codes(user_id, code_hash, created_at) VALUES (?, ?, ?)",
-        [(user_id, recovery_code_hash(code), now()) for code in codes],
-    )
-    return codes
-
-
 def create_backup(label="auto"):
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -414,27 +400,6 @@ def ensure_daily_backup():
     return None
 
 
-def generate_totp_secret():
-    return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
-
-
-def totp_at(secret, timestamp=None):
-    padded = secret + "=" * ((8 - len(secret) % 8) % 8)
-    key = base64.b32decode(padded, casefold=True)
-    counter = int((timestamp or time.time()) // 30).to_bytes(8, "big")
-    digest = hmac.new(key, counter, hashlib.sha1).digest()  # nosec B324
-    offset = digest[-1] & 0x0F
-    value = int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF
-    return f"{value % 1_000_000:06d}"
-
-
-def valid_totp(secret, code):
-    if not re.fullmatch(r"\d{6}", code or ""):
-        return False
-    current = time.time()
-    return any(hmac.compare_digest(totp_at(secret, current + offset * 30), code) for offset in (-1, 0, 1))
-
-
 def add_notification(conn, user_id, kind, title, body, product_id=None, link_url=""):
     preference_column = NOTIFICATION_PREFERENCES.get(kind)
     if preference_column:
@@ -512,13 +477,13 @@ def reset_code_digest(challenge_id, code):
     return hashlib.pbkdf2_hmac("sha256", code.encode("utf-8"), challenge_id.encode("utf-8"), 50_000).hex()
 
 
-def send_sms_verification(phone, code):
+def send_sms_verification(phone, code, purpose="비밀번호 재설정"):
     if not SMS_WEBHOOK_URL:
         if APP_PRODUCTION:
             raise ValueError("운영 환경의 SMS 발송 서비스가 설정되지 않았습니다.")
         return code
     payload = json.dumps(
-        {"to": phone, "message": f"[White Market] 비밀번호 재설정 인증번호는 {code}입니다. 5분 안에 입력하세요."},
+        {"to": phone, "message": f"[White Market] {purpose} 인증번호는 {code}입니다. 5분 안에 입력하세요."},
         ensure_ascii=False,
     ).encode("utf-8")
     request = urllib.request.Request(
@@ -1023,6 +988,18 @@ def init_db():
                 used INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS login_verification_challenges (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                code_hash TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                ip_address TEXT NOT NULL DEFAULT '',
+                user_agent TEXT NOT NULL DEFAULT ''
+            );
+
             CREATE TABLE IF NOT EXISTS reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 reporter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1063,15 +1040,6 @@ def init_db():
                 viewer_key TEXT NOT NULL,
                 viewed_on TEXT NOT NULL,
                 PRIMARY KEY(product_id, viewer_key, viewed_on)
-            );
-
-            CREATE TABLE IF NOT EXISTS user_recovery_codes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                code_hash TEXT NOT NULL,
-                used_at TEXT NOT NULL DEFAULT '',
-                used_ip TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS search_history (
@@ -1185,9 +1153,10 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_transaction_history_tx ON transaction_history(transaction_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_transfers_sender ON wallet_transfers(sender_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_transfers_receiver ON wallet_transfers(receiver_id, id DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON user_recovery_codes(user_id, used_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_login_events_user ON login_events(user_id, id DESC)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone != ''")
+        conn.execute("UPDATE users SET two_factor_enabled = 0, two_factor_secret = '' WHERE two_factor_enabled != 0 OR two_factor_secret != ''")
+        conn.execute("DROP TABLE IF EXISTS user_recovery_codes")
         conn.execute(
             """
             INSERT OR IGNORE INTO product_images(product_id, image_url, position, is_primary, created_at)
@@ -1309,6 +1278,7 @@ class App(BaseHTTPRequestHandler):
                 ("GET", "/captcha.svg"): self.captcha_image,
                 ("GET", "/login"): self.login_page,
                 ("POST", "/login"): self.login,
+                ("POST", "/login/verify"): self.verify_conditional_login,
                 ("GET", "/password-change-required"): self.password_change_required_page,
                 ("POST", "/password-change-required"): self.password_change_required,
                 ("GET", "/password-reset"): self.password_reset_page,
@@ -1352,9 +1322,6 @@ class App(BaseHTTPRequestHandler):
                 ("POST", "/settings/notifications"): self.update_notification_settings,
                 ("GET", "/security"): self.security_page,
                 ("POST", "/security/sessions/logout-others"): self.logout_other_sessions,
-                ("POST", "/security/2fa/enable"): self.enable_two_factor,
-                ("POST", "/security/2fa/disable"): self.disable_two_factor,
-                ("POST", "/security/2fa/recovery/regenerate"): self.regenerate_recovery_codes,
                 ("GET", "/privacy"): self.privacy_page,
                 ("GET", "/privacy/export"): self.export_personal_data,
                 ("POST", "/account/delete"): self.delete_account,
@@ -1544,7 +1511,6 @@ class App(BaseHTTPRequestHandler):
   <title>White Market</title>
   <link rel="icon" type="image/png" href="/static/white-market-icon.png">
   <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/security.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main-content">본문 바로가기</a>
@@ -1921,8 +1887,6 @@ class App(BaseHTTPRequestHandler):
     def login_page(self, query, form):
         error = esc(query.get("error", ""))
         username = esc(form.get("username", ""))
-        show_reset = bool(query.get("show_reset"))
-        show_two_factor = bool(form.get("totp_code")) or "2단계 인증" in query.get("error", "")
         self.send_html(
             f"""
             <section class="panel narrow">
@@ -1934,14 +1898,29 @@ class App(BaseHTTPRequestHandler):
                 <label>비밀번호<input name="password" type="password" required autocomplete="current-password"></label>
                 <div class="login-options">
                   <a href="/password-reset">비밀번호 찾기</a>
-                  <details class="login-two-factor" {'open' if show_two_factor else ''}>
-                    <summary>2단계 인증 로그인</summary>
-                    <label>인증번호 또는 복구 코드<input name="totp_code" maxlength="12" autocomplete="one-time-code"><small>인증 앱의 6자리 번호 또는 XXXX-XXXX 형식의 복구 코드를 입력하세요.</small></label>
-                  </details>
                 </div>
                 <button class="primary">로그인</button>
               </form>
-              {f'<div class="notice"><strong>계정이 잠겼습니다.</strong><p>등록된 휴대전화로 본인인증 후 비밀번호를 변경하세요.</p><a class="button" href="/password-reset?username={quote(form.get("username", ""))}">본인인증 시작</a></div>' if show_reset else ''}
+            </section>
+            """
+        )
+
+    def conditional_login_page(self, challenge_id, user, dev_code="", error=""):
+        self.send_html(
+            f"""
+            <section class="panel narrow">
+              <h1>추가 본인인증</h1>
+              <p class="muted">로그인 실패가 5회 누적되어 등록된 휴대전화로 본인인증을 진행합니다.</p>
+              <p>{esc(mask_phone(user["phone"]))} 번호로 인증번호를 발송했습니다.</p>
+              {f'<p class="form-error" role="alert">{esc(error)}</p>' if error else ''}
+              {f'<div class="notice"><strong>로컬 개발용 인증번호</strong><p class="dev-code">{esc(dev_code)}</p><small>실서비스에서는 SMS로만 발송됩니다.</small></div>' if dev_code else ''}
+              <form method="post" action="/login/verify">
+                {self.csrf_input()}
+                <input type="hidden" name="challenge_id" value="{esc(challenge_id)}">
+                <label>6자리 인증번호<input name="code" required pattern="[0-9]{{6}}" maxlength="6" inputmode="numeric" autocomplete="one-time-code"></label>
+                <button class="primary">인증 후 로그인</button>
+              </form>
+              <p class="login-options"><a href="/login">로그인으로 돌아가기</a></p>
             </section>
             """
         )
@@ -1949,7 +1928,6 @@ class App(BaseHTTPRequestHandler):
     def login(self, query, form):
         username = form.get("username", "").strip()
         password = form.get("password", "")
-        totp_code = form.get("totp_code", "").strip()
         ip_address = self.client_address[0][:64]
         user_agent = self.headers.get("User-Agent", "")[:300]
         enforce_rate_limit(
@@ -1967,14 +1945,6 @@ class App(BaseHTTPRequestHandler):
                     (user["id"] if user else None, username[:50], ip_address, user_agent, now()),
                 )
                 return self.login_page({"error": "아이디 또는 비밀번호가 올바르지 않거나 정지된 계정입니다."}, form)
-            if user["password_reset_required"]:
-                return self.login_page(
-                    {
-                        "error": "로그인 실패 5회로 계정이 잠겼습니다. 본인인증 후 비밀번호를 변경하세요.",
-                        "show_reset": bool(user["phone"]),
-                    },
-                    form,
-                )
             if not verify_password(password, user["password_salt"], user["password_hash"]):
                 failed_count = user["failed_login_count"] + 1
                 locked = failed_count >= 5
@@ -1986,27 +1956,37 @@ class App(BaseHTTPRequestHandler):
                     "INSERT INTO login_events(user_id, username_attempt, success, ip_address, user_agent, created_at) VALUES (?, ?, 0, ?, ?, ?)",
                     (user["id"], username[:50], ip_address, user_agent, now()),
                 )
-                message = "로그인 실패 5회로 계정이 잠겼습니다. 본인인증 후 비밀번호를 변경하세요." if locked else "아이디 또는 비밀번호가 올바르지 않습니다."
-                return self.login_page({"error": message, "show_reset": locked and bool(user["phone"])}, form)
-            recovery_used = False
-            if user["two_factor_enabled"] and not valid_totp(user["two_factor_secret"], totp_code):
-                recovery = conn.execute(
-                    "SELECT * FROM user_recovery_codes WHERE user_id = ? AND code_hash = ? AND used_at = ''",
-                    (user["id"], recovery_code_hash(totp_code)),
-                ).fetchone()
-                if recovery:
-                    conn.execute(
-                        "UPDATE user_recovery_codes SET used_at = ?, used_ip = ? WHERE id = ? AND used_at = ''",
-                        (now(), ip_address, recovery["id"]),
-                    )
-                    write_account_log(conn, user["id"], "2단계 인증 복구 코드 사용", f"복구 코드 #{recovery['id']}", ip_address)
-                    recovery_used = True
-                else:
-                    conn.execute(
-                        "INSERT INTO login_events(user_id, username_attempt, success, ip_address, user_agent, created_at) VALUES (?, ?, 0, ?, ?, ?)",
-                        (user["id"], username[:50], ip_address, user_agent, now()),
-                    )
-                    return self.login_page({"error": "2단계 인증번호 또는 복구 코드가 올바르지 않습니다."}, form)
+                message = "로그인 실패가 5회 누적되었습니다. 다음 로그인부터 휴대전화 본인인증이 필요합니다." if locked else "아이디 또는 비밀번호가 올바르지 않습니다."
+                return self.login_page({"error": message}, form)
+            if user["password_reset_required"]:
+                if not user["phone"]:
+                    return self.login_page({"error": "등록된 휴대전화가 없어 추가 본인인증을 진행할 수 없습니다. 관리자에게 문의하세요."}, form)
+                current_time = int(time.time())
+                conn.execute(
+                    "DELETE FROM login_verification_challenges WHERE user_id = ? OR expires_at < ? OR used = 1",
+                    (user["id"], current_time),
+                )
+                challenge_id = secrets.token_urlsafe(24)
+                code = f"{secrets.randbelow(1_000_000):06d}"
+                conn.execute(
+                    """
+                    INSERT INTO login_verification_challenges(
+                        id, user_id, code_hash, created_at, expires_at, ip_address, user_agent
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        challenge_id,
+                        user["id"],
+                        reset_code_digest(challenge_id, code),
+                        current_time,
+                        current_time + PASSWORD_RESET_SECONDS,
+                        ip_address,
+                        user_agent,
+                    ),
+                )
+                dev_code = send_sms_verification(user["phone"], code, "로그인 추가 본인인증")
+                write_account_log(conn, user["id"], "조건부 로그인 인증번호 발급", "로그인 실패 5회 누적", ip_address)
+                return self.conditional_login_page(challenge_id, user, dev_code)
             previous_success = conn.execute(
                 "SELECT ip_address, user_agent FROM login_events WHERE user_id = ? AND success = 1 ORDER BY id DESC LIMIT 1",
                 (user["id"],),
@@ -2022,10 +2002,77 @@ class App(BaseHTTPRequestHandler):
             )
             if suspicious:
                 add_notification(conn, user["id"], "security", "새 환경에서 로그인", f"{ip_address}에서 새 로그인이 감지되었습니다.", None, "/security")
-            if recovery_used:
-                add_notification(conn, user["id"], "security", "복구 코드 사용", "일회용 복구 코드로 로그인했습니다. 남은 코드를 확인해주세요.", None, "/security")
         self.login_user(user["id"])
         self.redirect("/password-change-required" if user["must_change_password"] else "/")
+
+    def verify_conditional_login(self, query, form):
+        challenge_id = form.get("challenge_id", "")
+        code = form.get("code", "").strip()
+        ip_address = self.client_address[0][:64]
+        user_agent = self.headers.get("User-Agent", "")[:300]
+        enforce_rate_limit(
+            "login-verification",
+            (f"ip:{ip_address}", f"challenge:{rate_identity(challenge_id)}"),
+            8,
+            15 * 60,
+        )
+        with db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            challenge = conn.execute(
+                """
+                SELECT c.*, u.username, u.phone, u.status, u.must_change_password
+                FROM login_verification_challenges c
+                JOIN users u ON u.id = c.user_id
+                WHERE c.id = ?
+                """,
+                (challenge_id,),
+            ).fetchone()
+            if (
+                not challenge
+                or challenge["used"]
+                or challenge["expires_at"] < int(time.time())
+                or challenge["attempts"] >= 5
+                or challenge["status"] != "active"
+                or challenge["ip_address"] != ip_address
+                or challenge["user_agent"] != user_agent
+            ):
+                raise ValueError("인증번호가 만료되었거나 더 이상 사용할 수 없습니다.")
+            conn.execute(
+                "UPDATE login_verification_challenges SET attempts = attempts + 1 WHERE id = ?",
+                (challenge_id,),
+            )
+            if not hmac.compare_digest(challenge["code_hash"], reset_code_digest(challenge_id, code)):
+                conn.execute(
+                    "INSERT INTO login_events(user_id, username_attempt, success, ip_address, user_agent, created_at) VALUES (?, ?, 0, ?, ?, ?)",
+                    (challenge["user_id"], challenge["username"], ip_address, user_agent, now()),
+                )
+                return self.conditional_login_page(challenge_id, challenge, error="인증번호가 올바르지 않습니다.")
+
+            previous_success = conn.execute(
+                "SELECT ip_address, user_agent FROM login_events WHERE user_id = ? AND success = 1 ORDER BY id DESC LIMIT 1",
+                (challenge["user_id"],),
+            ).fetchone()
+            suspicious = bool(previous_success and (previous_success["ip_address"] != ip_address or previous_success["user_agent"] != user_agent))
+            conn.execute(
+                "UPDATE users SET failed_login_count = 0, password_reset_required = 0 WHERE id = ?",
+                (challenge["user_id"],),
+            )
+            conn.execute("UPDATE login_verification_challenges SET used = 1 WHERE id = ?", (challenge_id,))
+            conn.execute(
+                "DELETE FROM login_verification_challenges WHERE user_id = ? AND id != ?",
+                (challenge["user_id"], challenge_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO login_events(user_id, username_attempt, success, suspicious, ip_address, user_agent, created_at)
+                VALUES (?, ?, 1, ?, ?, ?, ?)
+                """,
+                (challenge["user_id"], challenge["username"], int(suspicious), ip_address, user_agent, now()),
+            )
+            write_account_log(conn, challenge["user_id"], "조건부 휴대전화 인증 로그인", "로그인 실패 5회 후 본인인증 완료", ip_address)
+            add_notification(conn, challenge["user_id"], "security", "추가 본인인증 로그인", "로그인 실패 누적 후 휴대전화 본인인증으로 로그인했습니다.", None, "/security")
+        self.login_user(challenge["user_id"])
+        self.redirect("/password-change-required" if challenge["must_change_password"] else "/")
 
     def password_change_required_page(self, query, form):
         user = self.require_user()
@@ -2174,19 +2221,19 @@ class App(BaseHTTPRequestHandler):
             conn.execute(
                 """
                 UPDATE users SET password_salt = ?, password_hash = ?, failed_login_count = 0,
-                                 password_reset_required = 0, two_factor_enabled = 0, two_factor_secret = ''
+                                 password_reset_required = 0
                 WHERE id = ?
                 """,
                 (salt, digest, challenge["user_id"]),
             )
-            conn.execute("DELETE FROM user_recovery_codes WHERE user_id = ?", (challenge["user_id"],))
+            conn.execute("DELETE FROM login_verification_challenges WHERE user_id = ?", (challenge["user_id"],))
             conn.execute("UPDATE password_reset_challenges SET used = 1 WHERE id = ?", (challenge_id,))
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (challenge["user_id"],))
             write_account_log(
                 conn,
                 challenge["user_id"],
                 "휴대전화 본인인증 비밀번호 재설정",
-                "비밀번호 변경 및 2단계 인증 초기화",
+                "비밀번호 변경 및 로그인 실패 누적 초기화",
                 self.client_address[0],
             )
         self.send_html('<section class="panel narrow"><h1>비밀번호 변경 완료</h1><p>새 비밀번호로 로그인할 수 있습니다.</p><a class="primary" href="/login">로그인</a></section>')
@@ -3147,10 +3194,6 @@ class App(BaseHTTPRequestHandler):
                 "SELECT * FROM login_events WHERE user_id = ? ORDER BY id DESC LIMIT 50",
                 (user["id"],),
             ).fetchall()
-            recovery_rows = conn.execute(
-                "SELECT id, used_at, used_ip, created_at FROM user_recovery_codes WHERE user_id = ? ORDER BY id",
-                (user["id"],),
-            ).fetchall()
         session_rows = "".join(
             f"""
             <tr>
@@ -3173,59 +3216,15 @@ class App(BaseHTTPRequestHandler):
             """
             for event in login_events
         )
-        secret = generate_totp_secret()
-        otp_uri = f"otpauth://totp/White%20Market:{quote(user['username'])}?secret={secret}&issuer=White%20Market"
-        if user["two_factor_enabled"]:
-            unused_recovery = sum(1 for row in recovery_rows if not row["used_at"])
-            recovery_history = "".join(
-                f"<li>코드 #{row['id']} · {esc(row['used_at'])} · {esc(row['used_ip'] or '-')}</li>"
-                for row in recovery_rows
-                if row["used_at"]
-            )
-            two_factor_panel = f"""
-            <div class="security-setting enabled">
-              <div><span class="status-badge">사용 중</span><h2>2단계 인증</h2><p>로그인할 때 인증 앱의 6자리 번호를 함께 확인합니다.</p></div>
-              <div class="notice"><strong>복구 코드 {unused_recovery}개 남음</strong><p>인증 앱을 잃어버렸다면 로그인 화면에 일회용 복구 코드를 입력할 수 있습니다.</p></div>
-              <details>
-                <summary>복구 코드 사용 기록</summary>
-                <ul>{recovery_history or '<li>아직 사용한 복구 코드가 없습니다.</li>'}</ul>
-              </details>
-              <form method="post" action="/security/2fa/recovery/regenerate">
-                {self.csrf_input(user)}
-                <label>현재 비밀번호<input name="password" type="password" required autocomplete="current-password"></label>
-                <label>인증번호<input name="totp_code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" required autocomplete="one-time-code"></label>
-                <button>새 복구 코드 발급</button>
-              </form>
-              <form method="post" action="/security/2fa/disable">
-                {self.csrf_input(user)}
-                <label>현재 비밀번호<input name="password" type="password" required autocomplete="current-password"></label>
-                <label>인증번호<input name="totp_code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" required autocomplete="one-time-code"></label>
-                <button class="danger">2단계 인증 해제</button>
-              </form>
-            </div>
-            """
-        else:
-            two_factor_panel = f"""
-            <div class="security-setting">
-              <h2>2단계 인증</h2>
-              <p>인증 앱에 아래 키를 직접 등록한 뒤 생성된 번호를 입력하세요.</p>
-              <div class="totp-secret"><code>{secret}</code></div>
-              <p class="muted"><a href="{esc(otp_uri)}">이 기기의 인증 앱으로 열기</a></p>
-              <form method="post" action="/security/2fa/enable">
-                {self.csrf_input(user)}
-                <input type="hidden" name="secret" value="{secret}">
-                <label>현재 비밀번호<input name="password" type="password" required autocomplete="current-password"></label>
-                <label>인증번호<input name="totp_code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" required autocomplete="one-time-code"></label>
-                <button class="primary">2단계 인증 켜기</button>
-              </form>
-            </div>
-            """
         self.send_html(
             f"""
             <section>
               <div class="section-title"><h1>로그인 보안 관리</h1><a class="button" href="/settings">설정으로</a></div>
               <div class="panel security-grid">
-                {two_factor_panel}
+                <div class="security-setting">
+                  <h2>조건부 추가 본인인증</h2>
+                  <p>평소에는 아이디와 비밀번호로 로그인합니다. 비밀번호 입력을 5회 이상 실패하면 등록된 휴대전화 인증이 자동으로 적용됩니다.</p>
+                </div>
                 <div class="security-setting">
                   <h2>로그인된 기기</h2>
                   <p>현재 로그인된 세션은 {len(sessions)}개입니다.</p>
@@ -3252,78 +3251,6 @@ class App(BaseHTTPRequestHandler):
             ).rowcount
             write_account_log(conn, user["id"], "다른 세션 로그아웃", f"{deleted}개 세션 종료", self.client_address[0])
         self.redirect("/security")
-
-    def enable_two_factor(self, query, form):
-        user = self.require_user()
-        if not user:
-            return
-        secret = form.get("secret", "").strip().upper()
-        if user["two_factor_enabled"]:
-            raise ValueError("이미 2단계 인증을 사용 중입니다.")
-        if not re.fullmatch(r"[A-Z2-7]{32}", secret):
-            raise ValueError("2단계 인증 설정 키를 다시 확인해주세요.")
-        if not verify_password(form.get("password", ""), user["password_salt"], user["password_hash"]):
-            raise ValueError("현재 비밀번호가 올바르지 않습니다.")
-        if not valid_totp(secret, form.get("totp_code", "")):
-            raise ValueError("인증 앱의 번호가 올바르지 않습니다.")
-        with db() as conn:
-            conn.execute("UPDATE users SET two_factor_enabled = 1, two_factor_secret = ? WHERE id = ?", (secret, user["id"]))
-            recovery_codes = issue_recovery_codes(conn, user["id"])
-            write_account_log(conn, user["id"], "2단계 인증 활성화", "", self.client_address[0])
-        code_items = "".join(f"<li><code>{esc(code)}</code></li>" for code in recovery_codes)
-        self.send_html(
-            f"""
-            <section class="panel narrow recovery-codes">
-              <h1>복구 코드를 보관해주세요</h1>
-              <p>인증 앱을 사용할 수 없을 때 각 코드를 한 번씩 사용할 수 있습니다. 이 화면을 닫으면 코드 원문은 다시 확인할 수 없습니다.</p>
-              <ul>{code_items}</ul>
-              <button type="button" data-copy-recovery>복구 코드 복사</button>
-              <a class="primary" href="/security">확인 완료</a>
-            </section>
-            """
-        )
-
-    def disable_two_factor(self, query, form):
-        user = self.require_user()
-        if not user:
-            return
-        if not user["two_factor_enabled"]:
-            raise ValueError("2단계 인증을 사용 중이지 않습니다.")
-        if not verify_password(form.get("password", ""), user["password_salt"], user["password_hash"]):
-            raise ValueError("현재 비밀번호가 올바르지 않습니다.")
-        if not valid_totp(user["two_factor_secret"], form.get("totp_code", "")):
-            raise ValueError("인증 앱의 번호가 올바르지 않습니다.")
-        with db() as conn:
-            conn.execute("UPDATE users SET two_factor_enabled = 0, two_factor_secret = '' WHERE id = ?", (user["id"],))
-            conn.execute("DELETE FROM user_recovery_codes WHERE user_id = ?", (user["id"],))
-            write_account_log(conn, user["id"], "2단계 인증 해제", "", self.client_address[0])
-        self.redirect("/security")
-
-    def regenerate_recovery_codes(self, query, form):
-        user = self.require_user()
-        if not user:
-            return
-        if not user["two_factor_enabled"]:
-            raise ValueError("2단계 인증을 사용 중이지 않습니다.")
-        if not verify_password(form.get("password", ""), user["password_salt"], user["password_hash"]):
-            raise ValueError("현재 비밀번호가 올바르지 않습니다.")
-        if not valid_totp(user["two_factor_secret"], form.get("totp_code", "")):
-            raise ValueError("인증 앱의 번호가 올바르지 않습니다.")
-        with db() as conn:
-            recovery_codes = issue_recovery_codes(conn, user["id"])
-            write_account_log(conn, user["id"], "2단계 인증 복구 코드 재발급", "기존 코드 폐기", self.client_address[0])
-        code_items = "".join(f"<li><code>{esc(code)}</code></li>" for code in recovery_codes)
-        self.send_html(
-            f"""
-            <section class="panel narrow recovery-codes">
-              <h1>새 복구 코드</h1>
-              <p>기존 복구 코드는 모두 폐기되었습니다. 아래 코드는 이번 한 번만 표시됩니다.</p>
-              <ul>{code_items}</ul>
-              <button type="button" data-copy-recovery>복구 코드 복사</button>
-              <a class="primary" href="/security">확인 완료</a>
-            </section>
-            """
-        )
 
     def privacy_page(self, query, form):
         user = self.require_user()
@@ -3354,7 +3281,6 @@ class App(BaseHTTPRequestHandler):
                   <form method="post" action="/account/delete">
                     {self.csrf_input(user)}
                     <label>현재 비밀번호<input name="password" type="password" required autocomplete="current-password"></label>
-                    {f'<label>2단계 인증번호<input name="totp_code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" required autocomplete="one-time-code"></label>' if user["two_factor_enabled"] else ''}
                     <label class="check-label"><input type="checkbox" name="confirm_delete" value="yes" required> 상품 비공개와 계정 익명화 내용을 확인했습니다.</label>
                     <button class="danger">회원 탈퇴</button>
                   </form>
@@ -3372,7 +3298,7 @@ class App(BaseHTTPRequestHandler):
         with db() as conn:
             account = conn.execute(
                 """
-                SELECT id, username, display_name, bio, phone, location, status, two_factor_enabled, created_at
+                SELECT id, username, display_name, bio, phone, location, status, created_at
                 FROM users WHERE id = ?
                 """,
                 (user["id"],),
@@ -3439,8 +3365,6 @@ class App(BaseHTTPRequestHandler):
             raise ValueError("회원 탈퇴 내용을 확인해주세요.")
         if not verify_password(form.get("password", ""), user["password_salt"], user["password_hash"]):
             raise ValueError("현재 비밀번호가 올바르지 않습니다.")
-        if user["two_factor_enabled"] and not valid_totp(user["two_factor_secret"], form.get("totp_code", "")):
-            raise ValueError("2단계 인증번호가 올바르지 않습니다.")
         profile_image_url = user["profile_image_url"]
         product_image_urls = []
         random_salt, random_hash = hash_password(secrets.token_urlsafe(48))
@@ -3464,6 +3388,7 @@ class App(BaseHTTPRequestHandler):
             conn.execute("DELETE FROM keyword_alerts WHERE user_id = ?", (user["id"],))
             conn.execute("DELETE FROM notifications WHERE user_id = ?", (user["id"],))
             conn.execute("DELETE FROM password_reset_challenges WHERE user_id = ?", (user["id"],))
+            conn.execute("DELETE FROM login_verification_challenges WHERE user_id = ?", (user["id"],))
             conn.execute("UPDATE wallets SET balance = 0, updated_at = ? WHERE user_id = ?", (now(), user["id"]))
             conn.execute("UPDATE login_events SET ip_address = '', user_agent = '', username_attempt = '' WHERE user_id = ?", (user["id"],))
             conn.execute(
@@ -3472,8 +3397,7 @@ class App(BaseHTTPRequestHandler):
                 SET username = ?, display_name = '탈퇴 사용자', bio = '', phone = '', location = '',
                     profile_image_url = '', status = 'deleted', password_salt = ?, password_hash = ?,
                     failed_login_count = 0, password_reset_required = 0,
-                    notify_chat = 0, notify_price = 0, notify_transaction = 0, notify_notice = 0, notify_security = 0,
-                    two_factor_enabled = 0, two_factor_secret = ''
+                    notify_chat = 0, notify_price = 0, notify_transaction = 0, notify_notice = 0, notify_security = 0
                 WHERE id = ?
                 """,
                 (anonymized_username, random_salt, random_hash, user["id"]),
@@ -4917,7 +4841,7 @@ class App(BaseHTTPRequestHandler):
         backup_rows = "".join(
             f"""
             <tr><td>{esc(item.name)}</td><td>{item.stat().st_size / 1024 / 1024:.2f} MB</td><td>{datetime.fromtimestamp(item.stat().st_mtime).strftime("%Y-%m-%d %H:%M")}</td>
-            <td><form method="post" action="/admin/restore" class="backup-restore-form">{self.csrf_input(admin)}<input type="hidden" name="filename" value="{esc(item.name)}"><input name="password" type="password" required autocomplete="current-password" placeholder="관리자 비밀번호">{f'<input name="totp_code" required inputmode="numeric" maxlength="6" placeholder="2단계 인증번호">' if admin["two_factor_enabled"] else ''}<input name="confirmation" required autocomplete="off" placeholder="RESTORE 입력"><button class="danger">복원</button></form></td></tr>
+            <td><form method="post" action="/admin/restore" class="backup-restore-form">{self.csrf_input(admin)}<input type="hidden" name="filename" value="{esc(item.name)}"><input name="password" type="password" required autocomplete="current-password" placeholder="관리자 비밀번호"><input name="confirmation" required autocomplete="off" placeholder="RESTORE 입력"><button class="danger">복원</button></form></td></tr>
             """
             for item in backups
         )
@@ -4954,8 +4878,6 @@ class App(BaseHTTPRequestHandler):
             return
         if not verify_password(form.get("password", ""), admin["password_salt"], admin["password_hash"]):
             raise ValueError("관리자 비밀번호가 올바르지 않습니다.")
-        if admin["two_factor_enabled"] and not valid_totp(admin["two_factor_secret"], form.get("totp_code", "")):
-            raise ValueError("관리자 2단계 인증번호가 올바르지 않습니다.")
         if form.get("confirmation", "") != "RESTORE":
             raise ValueError("복원 확인란에 RESTORE를 정확히 입력해주세요.")
         enforce_rate_limit(
