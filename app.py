@@ -14,6 +14,7 @@ import traceback
 import tempfile
 import urllib.error
 import urllib.request
+import zlib
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from http import HTTPStatus
@@ -182,6 +183,20 @@ def profile_avatar(user, size=""):
     return f'<span class="{classes} profile-avatar-fallback" role="img" aria-label="{esc(label)}">{esc(initial)}</span>'
 
 
+def settings_navigation(active):
+    links = [
+        ("/settings", "notifications", "알림 설정"),
+        ("/security", "security", "보안 설정"),
+        ("/privacy", "privacy", "개인정보 설정"),
+    ]
+    items = "".join(
+        f'<a href="{path}" class="{"active" if key == active else ""}"'
+        f'{" aria-current=\"page\"" if key == active else ""}>{label}</a>'
+        for path, key, label in links
+    )
+    return f'<nav class="settings-nav" aria-label="계정 설정">{items}</nav>'
+
+
 def jpeg_dimensions(image_bytes):
     start_of_frame_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
     position = 2
@@ -212,10 +227,49 @@ def jpeg_dimensions(image_bytes):
     return None
 
 
+def png_dimensions(image_bytes):
+    if not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    position = 8
+    dimensions = None
+    saw_image_data = False
+    while position + 12 <= len(image_bytes):
+        chunk_length = int.from_bytes(image_bytes[position:position + 4], "big")
+        chunk_type = image_bytes[position + 4:position + 8]
+        chunk_end = position + 12 + chunk_length
+        if chunk_length > MAX_PROFILE_IMAGE_BYTES or chunk_end > len(image_bytes):
+            return None
+        chunk_data = image_bytes[position + 8:position + 8 + chunk_length]
+        expected_crc = int.from_bytes(image_bytes[position + 8 + chunk_length:chunk_end], "big")
+        actual_crc = zlib.crc32(chunk_type)
+        actual_crc = zlib.crc32(chunk_data, actual_crc) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            return None
+        if position == 8:
+            if chunk_type != b"IHDR" or chunk_length != 13:
+                return None
+            width = int.from_bytes(chunk_data[0:4], "big")
+            height = int.from_bytes(chunk_data[4:8], "big")
+            dimensions = (width, height)
+        elif chunk_type == b"IDAT":
+            saw_image_data = True
+        elif chunk_type == b"IEND":
+            if chunk_length != 0 or chunk_end != len(image_bytes):
+                return None
+            return dimensions if dimensions and saw_image_data else None
+        position = chunk_end
+    return None
+
+
 def save_profile_image(data_url):
-    prefix = "data:image/jpeg;base64,"
-    if not data_url.startswith(prefix):
+    formats = {
+        "data:image/jpeg;base64,": (".jpg", b"\xff\xd8\xff", jpeg_dimensions),
+        "data:image/png;base64,": (".png", b"\x89PNG\r\n\x1a\n", png_dimensions),
+    }
+    selected = next(((prefix, details) for prefix, details in formats.items() if data_url.startswith(prefix)), None)
+    if not selected:
         raise ValueError("프로필 사진을 다시 선택해주세요.")
+    prefix, (extension, signature, dimension_reader) = selected
     encoded = data_url[len(prefix):]
     if len(encoded) > ((MAX_PROFILE_IMAGE_BYTES + 2) // 3) * 4:
         raise ValueError("프로필 사진 용량이 너무 큽니다.")
@@ -225,14 +279,16 @@ def save_profile_image(data_url):
         raise ValueError("프로필 사진 형식을 확인해주세요.")
     if not image_bytes or len(image_bytes) > MAX_PROFILE_IMAGE_BYTES:
         raise ValueError("프로필 사진은 500KB 이하로 등록해주세요.")
-    if not image_bytes.startswith(b"\xff\xd8\xff") or not image_bytes.endswith(b"\xff\xd9"):
-        raise ValueError("JPEG 프로필 사진만 저장할 수 있습니다.")
-    dimensions = jpeg_dimensions(image_bytes)
+    if not image_bytes.startswith(signature):
+        raise ValueError("프로필 사진 형식을 확인해주세요.")
+    if extension == ".jpg" and not image_bytes.endswith(b"\xff\xd9"):
+        raise ValueError("JPEG 프로필 사진 형식을 확인해주세요.")
+    dimensions = dimension_reader(image_bytes)
     if not dimensions or min(dimensions) < 1 or max(dimensions) > 512:
         raise ValueError("프로필 사진 크기를 확인해주세요.")
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"{secrets.token_hex(16)}.jpg"
+    filename = f"{secrets.token_hex(16)}{extension}"
     (PROFILE_DIR / filename).write_bytes(image_bytes)
     return f"/static/profiles/{filename}"
 
@@ -1287,6 +1343,8 @@ class App(BaseHTTPRequestHandler):
                 ("POST", "/logout"): self.logout,
                 ("GET", "/mypage"): self.mypage,
                 ("POST", "/mypage"): self.update_mypage,
+                ("GET", "/password-change"): self.password_change_page,
+                ("POST", "/password-change"): self.change_password,
                 ("GET", "/users"): self.users_page,
                 ("GET", "/user"): self.user_detail,
                 ("POST", "/block"): self.block_user,
@@ -2285,13 +2343,34 @@ class App(BaseHTTPRequestHandler):
             for a in alerts
         )
         block_items = "".join(f'<li>{esc(b["display_name"])} (@{esc(b["username"])})</li>' for b in blocks)
+        saved_notice = '<p class="success-message" role="status">프로필 정보를 저장했습니다.</p>' if query.get("saved") == "1" else ""
         self.send_html(
             f"""
-            <section class="profile">
-              <div class="panel">
+            <section class="panel profile-overview">
+              <div class="profile-edit-heading">
+                {profile_avatar(user, "large profile-preview")}
+                <div>
+                  <p class="eyebrow">내 프로필</p>
+                  <h1>{esc(user["display_name"])}</h1>
+                  <p class="muted">@{esc(user["username"])} · {esc(user["location"])}</p>
+                  {rating_display(profile_rating["rating_average"], profile_rating["rating_count"])}
+                </div>
+              </div>
+              <div class="profile-stats" aria-label="내 활동 요약">
+                <a href="#my-products"><strong>{len(mine)}</strong><span>등록 상품</span></a>
+                <a href="#my-favorites"><strong>{len(favs)}</strong><span>찜한 상품</span></a>
+                <a href="#recent-products"><strong>{len(recent)}</strong><span>최근 본 상품</span></a>
+              </div>
+            </section>
+            {saved_notice}
+            <section class="profile profile-workspace">
+              <div class="panel profile-editor-panel">
+                <div class="section-title">
+                  <div><p class="eyebrow">프로필 관리</p><h2>내 정보 수정</h2></div>
+                </div>
                 <div class="profile-edit-heading">
                   {profile_avatar(user, "large profile-preview")}
-                  <div><h1>마이페이지</h1>{rating_display(profile_rating["rating_average"], profile_rating["rating_count"])}</div>
+                  <div><strong>{esc(user["display_name"])}</strong><p class="muted">상대방에게 공개되는 프로필입니다.</p></div>
                 </div>
                 <form method="post" action="/mypage" id="profile-form">
                   {self.csrf_input(user)}
@@ -2309,27 +2388,38 @@ class App(BaseHTTPRequestHandler):
                   <button class="primary">저장</button>
                 </form>
               </div>
-              <div class="panel">
-                <div class="wallet-compact">
-                  <span>내 WM 포인트</span>
-                  <strong>{won(wallet["balance"] if wallet else 0)}</strong>
-                  <small>실제 현금 가치가 없는 교육용 포인트입니다.</small>
-                  <a class="button account-page-link" href="/transactions">송금·거래 내역</a>
-                </div>
-                <hr>
-                <h2>키워드 알림</h2>
-                <form method="post" action="/alerts" class="inline">
-                  {self.csrf_input(user)}
-                  <input name="keyword" maxlength="30" placeholder="예: 자전거" required>
-                  <button>추가</button>
-                </form>
-                <ul>{alert_items or '<li>등록된 키워드가 없습니다.</li>'}</ul>
-                <a class="button account-page-link" href="/settings">알림·보안·개인정보 설정</a>
-              </div>
+              <aside class="profile-sidebar">
+                <section class="panel">
+                  <div class="wallet-compact">
+                    <span>내 WM 포인트</span>
+                    <strong>{won(wallet["balance"] if wallet else 0)}</strong>
+                    <small>실제 현금 가치가 없는 교육용 포인트입니다.</small>
+                    <a class="button account-page-link" href="/transactions">송금·거래 내역</a>
+                  </div>
+                </section>
+                <section class="panel">
+                  <h2>계정 관리</h2>
+                  <div class="account-settings-menu">
+                    <a href="/password-change"><strong>비밀번호 변경</strong><span>현재 비밀번호를 확인하고 변경합니다.</span></a>
+                    <a href="/settings"><strong>알림 설정</strong><span>알림 종류별 수신 여부를 관리합니다.</span></a>
+                    <a href="/security"><strong>보안 설정</strong><span>로그인 기기와 접속 기록을 확인합니다.</span></a>
+                    <a href="/privacy"><strong>개인정보 설정</strong><span>정보 다운로드와 회원 탈퇴를 관리합니다.</span></a>
+                  </div>
+                </section>
+                <section class="panel">
+                  <h2>키워드 알림</h2>
+                  <form method="post" action="/alerts" class="inline">
+                    {self.csrf_input(user)}
+                    <input name="keyword" maxlength="30" placeholder="예: 자전거" required>
+                    <button>추가</button>
+                  </form>
+                  <ul class="compact-list">{alert_items or '<li>등록된 키워드가 없습니다.</li>'}</ul>
+                </section>
+              </aside>
             </section>
-            <section><div class="section-title"><h2>내 상품</h2><a href="/product/new">등록</a></div><div class="grid">{''.join(product_card(p, owner=True, viewer=user, csrf=self.csrf_input(user), return_to=self.path) for p in mine) or '<p>등록한 상품이 없습니다.</p>'}</div></section>
-            <section><h2>찜한 상품</h2><div class="grid">{''.join(product_card(p, viewer=user, csrf=self.csrf_input(user), return_to=self.path) for p in favs) or '<p>찜한 상품이 없습니다.</p>'}</div></section>
-            <section><h2>최근 본 상품</h2><div class="grid">{''.join(product_card(p, viewer=user, csrf=self.csrf_input(user), return_to=self.path) for p in recent) or '<p>최근 본 상품이 없습니다.</p>'}</div></section>
+            <section id="my-products"><div class="section-title"><h2>내 상품</h2><a href="/product/new">등록</a></div><div class="grid">{''.join(product_card(p, owner=True, viewer=user, csrf=self.csrf_input(user), return_to=self.path) for p in mine) or '<p>등록한 상품이 없습니다.</p>'}</div></section>
+            <section id="my-favorites"><h2>찜한 상품</h2><div class="grid">{''.join(product_card(p, viewer=user, csrf=self.csrf_input(user), return_to=self.path) for p in favs) or '<p>찜한 상품이 없습니다.</p>'}</div></section>
+            <section id="recent-products"><h2>최근 본 상품</h2><div class="grid">{''.join(product_card(p, viewer=user, csrf=self.csrf_input(user), return_to=self.path) for p in recent) or '<p>최근 본 상품이 없습니다.</p>'}</div></section>
             <section class="panel"><h2>차단한 사용자</h2><ul>{block_items or '<li>차단한 사용자가 없습니다.</li>'}</ul></section>
             <script src="/static/profile.js" defer></script>
             """
@@ -2372,7 +2462,68 @@ class App(BaseHTTPRequestHandler):
             raise
         if previous_image_url != profile_image_url:
             delete_profile_image(previous_image_url)
-        self.redirect("/mypage")
+        self.redirect("/mypage?saved=1")
+
+    def password_change_page(self, query, form):
+        user = self.require_user()
+        if not user:
+            return
+        changed_notice = '<p class="success-message" role="status">비밀번호를 변경하고 다른 기기의 로그인을 종료했습니다.</p>' if query.get("changed") == "1" else ""
+        self.send_html(
+            f"""
+            <section class="panel narrow password-change-panel">
+              <div class="section-title"><div><p class="eyebrow">계정 보호</p><h1>비밀번호 변경</h1></div><a class="button" href="/mypage">마이페이지</a></div>
+              {changed_notice}
+              <p class="muted">영문, 숫자, 특수문자를 섞어 8자 이상으로 입력하세요.</p>
+              <form method="post" action="/password-change">
+                {self.csrf_input(user)}
+                <label>현재 비밀번호<input name="current_password" type="password" required maxlength="128" autocomplete="current-password"></label>
+                <label>바꿀 비밀번호<input name="password" type="password" required minlength="8" maxlength="128" autocomplete="new-password"></label>
+                <label>바꿀 비밀번호 재입력<input name="password_confirm" type="password" required minlength="8" maxlength="128" autocomplete="new-password"></label>
+                <button class="primary">비밀번호 변경</button>
+              </form>
+            </section>
+            """
+        )
+
+    def change_password(self, query, form):
+        user = self.require_user()
+        if not user:
+            return
+        enforce_rate_limit(
+            "password-change",
+            (f"ip:{self.client_address[0]}", f"user:{user['id']}"),
+            8,
+            15 * 60,
+        )
+        current_password = form.get("current_password", "")
+        password = form.get("password", "")
+        if not verify_password(current_password, user["password_salt"], user["password_hash"]):
+            raise ValueError("현재 비밀번호가 올바르지 않습니다.")
+        if password != form.get("password_confirm", ""):
+            raise ValueError("바꿀 비밀번호 재입력이 일치하지 않습니다.")
+        validation_error = password_validation_error(password)
+        if validation_error:
+            raise ValueError(validation_error)
+        if hmac.compare_digest(current_password, password):
+            raise ValueError("현재 비밀번호와 다른 비밀번호를 사용해주세요.")
+        salt, digest = hash_password(password)
+        with db() as conn:
+            conn.execute(
+                """
+                UPDATE users SET password_salt = ?, password_hash = ?,
+                                 failed_login_count = 0, password_reset_required = 0
+                WHERE id = ?
+                """,
+                (salt, digest, user["id"]),
+            )
+            conn.execute(
+                "DELETE FROM sessions WHERE user_id = ? AND token != ?",
+                (user["id"], user["session_token"]),
+            )
+            conn.execute("DELETE FROM login_verification_challenges WHERE user_id = ?", (user["id"],))
+            write_account_log(conn, user["id"], "비밀번호 변경", "다른 로그인 세션 종료", self.client_address[0])
+        self.redirect("/password-change?changed=1")
 
     def users_page(self, query, form):
         user = self.require_user()
@@ -3147,21 +3298,17 @@ class App(BaseHTTPRequestHandler):
         )
         self.send_html(
             f"""
-            <section class="settings-layout">
+            <section class="settings-page">
+              <div class="section-title"><div><p class="eyebrow">내 계정</p><h1>알림 설정</h1></div><a class="button" href="/mypage">마이페이지</a></div>
+              {settings_navigation("notifications")}
+              {'<p class="success-message" role="status">알림 설정을 저장했습니다.</p>' if query.get("saved") == "1" else ""}
               <div class="panel">
-                <div class="section-title"><h1>설정</h1><a class="button" href="/mypage">마이페이지</a></div>
-                <h2>알림 설정</h2>
                 <form method="post" action="/settings/notifications">
                   {self.csrf_input(user)}
                   <div class="setting-list">{toggles}</div>
                   <button class="primary">알림 설정 저장</button>
                 </form>
               </div>
-              <aside class="panel settings-links">
-                <h2>계정 관리</h2>
-                <a href="/security">로그인 보안 관리</a>
-                <a href="/privacy">개인정보 및 회원 탈퇴</a>
-              </aside>
             </section>
             """
         )
@@ -3179,7 +3326,7 @@ class App(BaseHTTPRequestHandler):
                 """,
                 (*values, user["id"]),
             )
-        self.redirect("/settings")
+        self.redirect("/settings?saved=1")
 
     def security_page(self, query, form):
         user = self.require_user()
@@ -3218,15 +3365,21 @@ class App(BaseHTTPRequestHandler):
         )
         self.send_html(
             f"""
-            <section>
-              <div class="section-title"><h1>로그인 보안 관리</h1><a class="button" href="/settings">설정으로</a></div>
+            <section class="settings-page">
+              <div class="section-title"><div><p class="eyebrow">내 계정</p><h1>보안 설정</h1></div><a class="button" href="/mypage">마이페이지</a></div>
+              {settings_navigation("security")}
               <div class="panel security-grid">
                 <div class="security-setting">
                   <h2>조건부 추가 본인인증</h2>
                   <p>평소에는 아이디와 비밀번호로 로그인합니다. 비밀번호 입력을 5회 이상 실패하면 등록된 휴대전화 인증이 자동으로 적용됩니다.</p>
                 </div>
                 <div class="security-setting">
-                  <h2>로그인된 기기</h2>
+                  <h2>비밀번호</h2>
+                  <p>현재 비밀번호 확인 후 새 비밀번호로 변경할 수 있습니다.</p>
+                  <a class="button" href="/password-change">비밀번호 변경</a>
+                </div>
+                <div class="security-setting">
+                  <h2>로그인된 기기 관리</h2>
                   <p>현재 로그인된 세션은 {len(sessions)}개입니다.</p>
                   <form method="post" action="/security/sessions/logout-others">
                     {self.csrf_input(user)}
@@ -3267,8 +3420,9 @@ class App(BaseHTTPRequestHandler):
         )
         self.send_html(
             f"""
-            <section>
-              <div class="section-title"><h1>개인정보 및 회원 탈퇴</h1><a class="button" href="/settings">설정으로</a></div>
+            <section class="settings-page">
+              <div class="section-title"><div><p class="eyebrow">내 계정</p><h1>개인정보 설정</h1></div><a class="button" href="/mypage">마이페이지</a></div>
+              {settings_navigation("privacy")}
               <div class="privacy-grid">
                 <section class="panel">
                   <h2>내 개인정보 다운로드</h2>
