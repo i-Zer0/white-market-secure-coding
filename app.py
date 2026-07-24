@@ -1336,11 +1336,9 @@ class App(BaseHTTPRequestHandler):
                 ("GET", "/chat/stream"): self.chat_stream,
                 ("POST", "/chat"): self.send_message,
                 ("POST", "/chat/offer"): self.create_chat_offer,
-                ("POST", "/chat/appointment"): self.create_chat_appointment,
-                ("POST", "/chat/appointment/reschedule"): self.reschedule_chat_appointment,
+                ("POST", "/chat/reserve"): self.reserve_chat_transaction,
                 ("POST", "/chat/action"): self.update_chat_action,
                 ("POST", "/rating/chat"): self.rate_chat_user,
-                ("POST", "/transaction/request"): self.request_transaction,
                 ("GET", "/transactions"): self.transactions_page,
                 ("POST", "/transaction/status"): self.update_transaction_status,
                 ("POST", "/transaction/payment"): self.transfer_transaction_payment,
@@ -2672,7 +2670,7 @@ class App(BaseHTTPRequestHandler):
         action = "/product/edit" if is_edit else "/product/new"
         hidden = f'<input type="hidden" name="id" value="{product["id"]}">' if product else ""
         category_options = "".join(f'<option value="{c}" {"selected" if product and product["category"] == c else ""}>{c}</option>' for c in CATEGORIES)
-        status_note = f'<p class="notice">현재 거래 상태: <strong>{esc(product["status"])}</strong><br><small>거래 상태는 거래 요청 승인 과정에서 자동으로 변경됩니다.</small></p>' if product else ""
+        status_note = f'<p class="notice">현재 거래 상태: <strong>{esc(product["status"])}</strong><br><small>판매자는 구매자와 채팅한 뒤 거래 상태를 변경할 수 있습니다.</small></p>' if product else ""
         image_items = "".join(
             f"""
             <li class="product-image-item" data-image-id="{image["id"]}" data-image-url="{esc(image["image_url"])}" data-primary="{int(image["is_primary"])}">
@@ -2961,7 +2959,7 @@ class App(BaseHTTPRequestHandler):
             if active_transaction:
                 transaction_action = f'<a class="button" href="/transactions?focus={active_transaction["id"]}">{esc(active_transaction["status"])} 확인</a>'
             elif p["status"] == "판매중":
-                transaction_action = f'<form method="post" action="/transaction/request" class="inline">{self.csrf_input(user)}<input type="hidden" name="product_id" value="{p["id"]}"><button class="primary">거래 요청</button></form>'
+                transaction_action = ""
             else:
                 transaction_action = f'<span class="status-badge">현재 {esc(p["status"])}</span>'
             buyer_tools = f"""
@@ -3085,9 +3083,9 @@ class App(BaseHTTPRequestHandler):
         if not user:
             return
         notification_options = [
-            ("notify_chat", "채팅·가격 제안·거래 약속", "새 메시지와 채팅 안의 거래 제안을 알려드립니다."),
+            ("notify_chat", "채팅·가격 제안", "새 메시지와 채팅 안의 가격 제안을 알려드립니다."),
             ("notify_price", "찜 상품 가격 인하", "찜한 상품의 가격이 내려가면 알려드립니다."),
-            ("notify_transaction", "거래 상태", "거래 요청, 승인, 거절, 완료 상태를 알려드립니다."),
+            ("notify_transaction", "거래 상태", "예약중, 판매중 전환과 거래 완료 상태를 알려드립니다."),
             ("notify_notice", "공지사항", "관리자가 새 공지를 등록하면 알려드립니다."),
             ("notify_security", "보안", "새 환경 로그인처럼 확인이 필요한 활동을 알려드립니다."),
         ]
@@ -3620,6 +3618,7 @@ class App(BaseHTTPRequestHandler):
                         FROM chat_actions ca JOIN users actor ON actor.id = ca.actor_id
                         WHERE ca.product_id = ?
                           AND ((ca.buyer_id = ? AND ca.seller_id = ?) OR (ca.buyer_id = ? AND ca.seller_id = ?))
+                          AND ca.action_type = 'offer'
                         ORDER BY ca.id DESC
                         """,
                         (product_id, user["id"], peer_id, peer_id, user["id"]),
@@ -3683,12 +3682,8 @@ class App(BaseHTTPRequestHandler):
         action_cards = ""
         action_status_labels = {"pending": "응답 대기", "accepted": "수락됨", "rejected": "거절됨", "superseded": "변경 제안됨"}
         for chat_action in chat_actions:
-            if chat_action["action_type"] == "offer":
-                action_title = f"가격 제안 {won(chat_action['proposed_price'])}"
-                action_detail = f"{esc(chat_action['actor_name'])}님이 희망 가격을 제안했습니다."
-            else:
-                action_title = "거래 약속"
-                action_detail = f"{esc(chat_action['meeting_place'])} · {esc(chat_action['actor_name'])}님 제안"
+            action_title = f"가격 제안 {won(chat_action['proposed_price'])}"
+            action_detail = f"{esc(chat_action['actor_name'])}님이 희망 가격을 제안했습니다."
             response_buttons = ""
             if chat_action["status"] == "pending" and chat_action["actor_id"] != user["id"]:
                 response_buttons = f"""
@@ -3699,19 +3694,6 @@ class App(BaseHTTPRequestHandler):
                   <button name="decision" value="reject">거절</button>
                 </form>
                 """
-            reschedule_form = ""
-            if chat_action["action_type"] == "appointment" and chat_action["status"] in {"pending", "accepted"}:
-                reschedule_form = f"""
-                <details>
-                  <summary>장소 변경 제안</summary>
-                  <form method="post" action="/chat/appointment/reschedule">
-                    {self.csrf_input(user)}
-                    <input type="hidden" name="id" value="{chat_action["id"]}">
-                    <label>새 장소<input name="meeting_place" value="{esc(chat_action["meeting_place"])}" maxlength="100" required></label>
-                    <button>변경 제안</button>
-                  </form>
-                </details>
-                """
             history_items = "".join(
                 f'<li>{esc(history["created_at"])} · {esc(history["actor_name"])} · {esc(history["details"])}</li>'
                 for history in action_history.get(chat_action["id"], [])
@@ -3720,7 +3702,6 @@ class App(BaseHTTPRequestHandler):
             <article class="chat-action-card {esc(chat_action['status'])}">
               <div><span class="status-badge">{esc(action_status_labels.get(chat_action["status"], chat_action["status"]))}</span><h3>{action_title}</h3><p>{action_detail}</p></div>
               {response_buttons}
-              {reschedule_form}
               <details><summary>변경 기록 {len(action_history.get(chat_action["id"], []))}건</summary><ul>{history_items}</ul></details>
             </article>
             """
@@ -3729,15 +3710,28 @@ class App(BaseHTTPRequestHandler):
             transaction_control = ""
             if chat_transaction:
                 if chat_transaction["status"] == "예약중":
+                    seller_controls = ""
+                    if user["id"] == product_context["seller_id"]:
+                        seller_controls = f"""
+                        <div class="inline">
+                          <form method="post" action="/transaction/status" class="inline">
+                            {self.csrf_input(user)}
+                            <input type="hidden" name="id" value="{chat_transaction["id"]}">
+                            <input type="hidden" name="return_to_chat" value="1">
+                            <button name="action" value="reopen">판매중으로 변경</button>
+                          </form>
+                          <form method="post" action="/transaction/status" class="inline">
+                            {self.csrf_input(user)}
+                            <input type="hidden" name="id" value="{chat_transaction["id"]}">
+                            <input type="hidden" name="return_to_chat" value="1">
+                            <button class="primary" name="action" value="complete">거래 완료</button>
+                          </form>
+                        </div>
+                        """
                     transaction_control = f"""
                     <div class="chat-transaction-control">
-                      <span><strong>거래 예약중</strong><small>약속이 확정되었습니다. 거래가 끝나면 완료 처리해주세요.</small></span>
-                      <form method="post" action="/transaction/status" class="inline">
-                        {self.csrf_input(user)}
-                        <input type="hidden" name="id" value="{chat_transaction["id"]}">
-                        <input type="hidden" name="return_to_chat" value="1">
-                        <button class="primary" name="action" value="complete">거래 완료</button>
-                      </form>
+                      <span><strong>거래 예약중</strong><small>{'판매중으로 되돌리거나 거래 완료로 변경할 수 있습니다.' if seller_controls else '판매자가 거래 상태를 관리하고 있습니다.'}</small></span>
+                      {seller_controls}
                     </div>
                     """
                 else:
@@ -3746,6 +3740,30 @@ class App(BaseHTTPRequestHandler):
                       <span><strong>거래 완료</strong><small>완료된 거래입니다.</small></span>
                     </div>
                     """
+            elif user["id"] == product_context["seller_id"] and product_context["status"] == "판매중" and messages:
+                transaction_control = f"""
+                <div class="chat-transaction-control">
+                  <span><strong>거래 상태</strong><small>구매자와 거래가 확정되면 예약중으로 변경하세요.</small></span>
+                  <form method="post" action="/chat/reserve" class="inline">
+                    {self.csrf_input(user)}
+                    <input type="hidden" name="product_id" value="{product_id}">
+                    <input type="hidden" name="buyer_id" value="{peer_id}">
+                    <button class="primary">예약중으로 변경</button>
+                  </form>
+                </div>
+                """
+            elif user["id"] == product_context["seller_id"] and product_context["status"] == "판매중":
+                transaction_control = """
+                <div class="chat-transaction-control">
+                  <span><strong>거래 상태</strong><small>구매자와 메시지를 주고받은 뒤 예약중으로 변경할 수 있습니다.</small></span>
+                </div>
+                """
+            elif user["id"] == product_context["seller_id"] and product_context["status"] == "예약중":
+                transaction_control = """
+                <div class="chat-transaction-control">
+                  <span><strong>다른 구매자와 예약중</strong><small>예약을 진행한 채팅방에서 상태를 변경할 수 있습니다.</small></span>
+                </div>
+                """
             buyer_offer_form = ""
             if user["id"] != product_context["seller_id"]:
                 buyer_offer_form = f"""
@@ -3763,20 +3781,8 @@ class App(BaseHTTPRequestHandler):
             chat_action_panel = f"""
             <section class="chat-action-panel">
               {transaction_control}
-              <div class="chat-action-tools">
-                {buyer_offer_form}
-                <details>
-                  <summary>거래 약속 잡기</summary>
-                  <form method="post" action="/chat/appointment">
-                    {self.csrf_input(user)}
-                    <input type="hidden" name="product_id" value="{product_id}">
-                    <input type="hidden" name="peer_id" value="{peer_id}">
-                    <label>장소<input name="meeting_place" maxlength="100" required placeholder="예: 홍대입구역 2번 출구"></label>
-                    <button class="primary">약속 제안</button>
-                  </form>
-                </details>
-              </div>
-              {f'<details class="chat-action-history"><summary>가격 제안·약속 기록 {len(chat_actions)}건</summary><div class="chat-action-list">{action_cards}</div></details>' if chat_actions else ''}
+              {f'<div class="chat-action-tools">{buyer_offer_form}</div>' if buyer_offer_form else ''}
+              {f'<details class="chat-action-history"><summary>가격 제안 기록 {len(chat_actions)}건</summary><div class="chat-action-list">{action_cards}</div></details>' if chat_actions else ''}
             </section>
             """
         rating_form = ""
@@ -3990,131 +3996,49 @@ class App(BaseHTTPRequestHandler):
             add_notification(conn, peer_id, "offer", "새 가격 제안", f"{user['display_name']}님이 {won(price)}을 제안했습니다.", product_id, f"/chat?user={user['id']}&product={product_id}")
         self.redirect(f"/chat?user={peer_id}&product={product_id}")
 
-    def create_chat_appointment(self, query, form):
+    def reserve_chat_transaction(self, query, form):
         user = self.require_user()
         if not user:
             return
         product_id = int(form.get("product_id", "0") or "0")
-        peer_id = int(form.get("peer_id", "0") or "0")
-        meeting_place = form.get("meeting_place", "").strip()
-        if not (2 <= len(meeting_place) <= 100):
-            raise ValueError("거래 장소를 2-100자로 입력해주세요.")
-        with db() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            product = conn.execute("SELECT * FROM products WHERE id = ? AND is_deleted = 0", (product_id,)).fetchone()
-            if not product or product["seller_id"] not in (user["id"], peer_id) or user["id"] == peer_id:
-                raise ValueError("이 상품의 거래 약속을 만들 수 없습니다.")
-            seller_id = product["seller_id"]
-            buyer_id = peer_id if user["id"] == seller_id else user["id"]
-            action_id = conn.execute(
-                """
-                INSERT INTO chat_actions(product_id, buyer_id, seller_id, actor_id, action_type, meeting_place, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'appointment', ?, ?, ?)
-                """,
-                (product_id, buyer_id, seller_id, user["id"], meeting_place, now(), now()),
-            ).lastrowid
-            details = f"{meeting_place} 약속 제안"
-            conn.execute(
-                "INSERT INTO chat_action_history(action_id, actor_id, event_type, to_status, details, created_at) VALUES (?, ?, 'created', 'pending', ?, ?)",
-                (action_id, user["id"], details, now()),
-            )
-            conn.execute(
-                "INSERT INTO messages(sender_id, receiver_id, product_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user["id"], peer_id, product_id, f"거래 약속 장소를 제안했습니다: {meeting_place}", now()),
-            )
-            add_notification(conn, peer_id, "appointment", "새 거래 약속", details, product_id, f"/chat?user={user['id']}&product={product_id}")
-        self.redirect(f"/chat?user={peer_id}&product={product_id}")
+        buyer_id = int(form.get("buyer_id", "0") or "0")
+        if not product_id or not buyer_id or buyer_id == user["id"]:
+            raise ValueError("예약할 거래 상대를 확인해주세요.")
 
-    def reschedule_chat_appointment(self, query, form):
-        user = self.require_user()
-        if not user:
-            return
-        action_id = int(form.get("id", "0") or "0")
-        meeting_place = form.get("meeting_place", "").strip()
-        if not (2 <= len(meeting_place) <= 100):
-            raise ValueError("거래 장소를 2-100자로 입력해주세요.")
         with db() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            previous = conn.execute(
-                """
-                SELECT * FROM chat_actions
-                WHERE id = ? AND action_type = 'appointment' AND status IN ('pending', 'accepted')
-                  AND (buyer_id = ? OR seller_id = ?)
-                """,
-                (action_id, user["id"], user["id"]),
+            product = conn.execute(
+                "SELECT * FROM products WHERE id = ? AND seller_id = ? AND is_deleted = 0",
+                (product_id, user["id"]),
             ).fetchone()
-            if not previous:
-                raise ValueError("변경할 거래 약속을 찾을 수 없습니다.")
-            peer_id = previous["seller_id"] if user["id"] == previous["buyer_id"] else previous["buyer_id"]
-            new_id = conn.execute(
-                """
-                INSERT INTO chat_actions(
-                    product_id, buyer_id, seller_id, actor_id, action_type, meeting_place,
-                    supersedes_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'appointment', ?, ?, ?, ?)
-                """,
-                (
-                    previous["product_id"], previous["buyer_id"], previous["seller_id"], user["id"],
-                    meeting_place, action_id, now(), now(),
-                ),
-            ).lastrowid
-            conn.execute("UPDATE chat_actions SET status = 'superseded', updated_at = ? WHERE id = ?", (now(), action_id))
-            details = f"{previous['meeting_place']} → {meeting_place}"
-            conn.execute(
-                """
-                INSERT INTO chat_action_history(action_id, actor_id, event_type, from_status, to_status, details, created_at)
-                VALUES (?, ?, 'rescheduled', ?, 'superseded', ?, ?)
-                """,
-                (action_id, user["id"], previous["status"], details, now()),
-            )
-            conn.execute(
-                "INSERT INTO chat_action_history(action_id, actor_id, event_type, to_status, details, created_at) VALUES (?, ?, 'created', 'pending', ?, ?)",
-                (new_id, user["id"], f"약속 장소 변경 제안: {meeting_place}", now()),
-            )
-            conn.execute(
-                "INSERT INTO messages(sender_id, receiver_id, product_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user["id"], peer_id, previous["product_id"], f"거래 약속 장소 변경을 제안했습니다: {meeting_place}", now()),
-            )
-            add_notification(conn, peer_id, "appointment", "거래 약속 변경 제안", details, previous["product_id"], f"/chat?user={user['id']}&product={previous['product_id']}")
-        self.redirect(f"/chat?user={peer_id}&product={previous['product_id']}")
-
-    def reserve_transaction_from_appointment(self, conn, action, actor_id):
-        product = conn.execute(
-            "SELECT * FROM products WHERE id = ? AND is_deleted = 0",
-            (action["product_id"],),
-        ).fetchone()
-        if not product or product["status"] == "거래완료":
-            raise ValueError("거래 약속을 확정할 수 없는 상품입니다.")
-
-        reservation = conn.execute(
-            "SELECT * FROM transactions WHERE product_id = ? AND status = '예약중' ORDER BY id DESC LIMIT 1",
-            (action["product_id"],),
-        ).fetchone()
-        if reservation and reservation["buyer_id"] != action["buyer_id"]:
-            raise ValueError("이미 다른 구매자와 예약 중인 상품입니다.")
-
-        transaction = conn.execute(
-            """
-            SELECT * FROM transactions
-            WHERE product_id = ? AND buyer_id = ? AND seller_id = ?
-              AND status IN ('거래요청', '예약중')
-            ORDER BY CASE status WHEN '예약중' THEN 0 ELSE 1 END, id DESC
-            LIMIT 1
-            """,
-            (action["product_id"], action["buyer_id"], action["seller_id"]),
-        ).fetchone()
-        timestamp = now()
-        if transaction:
-            tx_id = transaction["id"]
-            from_status = transaction["status"]
-            if transaction["status"] == "거래요청":
-                conn.execute(
-                    "UPDATE transactions SET status = '예약중', updated_at = ? WHERE id = ?",
-                    (timestamp, tx_id),
-                )
-        else:
+            buyer = conn.execute(
+                "SELECT id, display_name FROM users WHERE id = ? AND status = 'active'",
+                (buyer_id,),
+            ).fetchone()
+            if not product or not buyer:
+                raise ValueError("예약할 상품이나 구매자를 찾을 수 없습니다.")
             if product["status"] != "판매중":
-                raise ValueError("현재 상품 상태에서는 새 예약을 만들 수 없습니다.")
+                raise ValueError("판매중인 상품만 예약중으로 변경할 수 있습니다.")
+            conversation = conn.execute(
+                """
+                SELECT 1 FROM messages
+                WHERE product_id = ?
+                  AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+                LIMIT 1
+                """,
+                (product_id, user["id"], buyer_id, buyer_id, user["id"]),
+            ).fetchone()
+            if not conversation:
+                raise ValueError("해당 상품에 대해 대화한 구매자만 예약할 수 있습니다.")
+
+            transaction = conn.execute(
+                """
+                SELECT * FROM transactions
+                WHERE product_id = ? AND seller_id = ? AND buyer_id = ? AND status = '거래요청'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (product_id, user["id"], buyer_id),
+            ).fetchone()
             accepted_offer = conn.execute(
                 """
                 SELECT proposed_price FROM chat_actions
@@ -4122,67 +4046,70 @@ class App(BaseHTTPRequestHandler):
                   AND action_type = 'offer' AND status = 'accepted' AND proposed_price > 0
                 ORDER BY id DESC LIMIT 1
                 """,
-                (action["product_id"], action["buyer_id"], action["seller_id"]),
+                (product_id, buyer_id, user["id"]),
             ).fetchone()
             agreed_price = accepted_offer["proposed_price"] if accepted_offer else product["price"]
-            tx_id = conn.execute(
-                """
-                INSERT INTO transactions(product_id, seller_id, buyer_id, status, agreed_price, created_at, updated_at)
-                VALUES (?, ?, ?, '예약중', ?, ?, ?)
-                """,
-                (
-                    action["product_id"],
-                    action["seller_id"],
-                    action["buyer_id"],
-                    agreed_price,
-                    timestamp,
-                    timestamp,
-                ),
-            ).lastrowid
-            from_status = ""
+            timestamp = now()
+            if transaction:
+                tx_id = transaction["id"]
+                from_status = transaction["status"]
+                conn.execute(
+                    "UPDATE transactions SET status = '예약중', agreed_price = ?, updated_at = ? WHERE id = ?",
+                    (agreed_price, timestamp, tx_id),
+                )
+            else:
+                tx_id = conn.execute(
+                    """
+                    INSERT INTO transactions(product_id, seller_id, buyer_id, status, agreed_price, created_at, updated_at)
+                    VALUES (?, ?, ?, '예약중', ?, ?, ?)
+                    """,
+                    (product_id, user["id"], buyer_id, agreed_price, timestamp, timestamp),
+                ).lastrowid
+                from_status = "판매중"
 
-        rejected_requests = conn.execute(
-            """
-            SELECT id, buyer_id FROM transactions
-            WHERE product_id = ? AND id != ? AND status = '거래요청'
-            """,
-            (action["product_id"], tx_id),
-        ).fetchall()
-        conn.execute(
-            "UPDATE products SET status = '예약중', updated_at = ? WHERE id = ?",
-            (timestamp, action["product_id"]),
-        )
-        conn.execute(
-            """
-            UPDATE transactions SET status = '거래거절', updated_at = ?
-            WHERE product_id = ? AND id != ? AND status = '거래요청'
-            """,
-            (timestamp, action["product_id"], tx_id),
-        )
-        conn.execute(
-            """
-            INSERT INTO transaction_history(transaction_id, actor_id, from_status, to_status, details, created_at)
-            VALUES (?, ?, ?, '예약중', ?, ?)
-            """,
-            (
-                tx_id,
-                actor_id,
-                from_status,
-                f"거래 약속 확정 · {action['meeting_place']}",
-                timestamp,
-            ),
-        )
-        for rejected_request in rejected_requests:
+            rejected_requests = conn.execute(
+                "SELECT id, buyer_id FROM transactions WHERE product_id = ? AND id != ? AND status = '거래요청'",
+                (product_id, tx_id),
+            ).fetchall()
+            conn.execute(
+                "UPDATE products SET status = '예약중', updated_at = ? WHERE id = ?",
+                (timestamp, product_id),
+            )
+            conn.execute(
+                "UPDATE transactions SET status = '거래거절', updated_at = ? WHERE product_id = ? AND id != ? AND status = '거래요청'",
+                (timestamp, product_id, tx_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO transaction_history(transaction_id, actor_id, from_status, to_status, details, created_at)
+                VALUES (?, ?, ?, '예약중', '판매자가 채팅 후 거래를 예약중으로 변경', ?)
+                """,
+                (tx_id, user["id"], from_status, timestamp),
+            )
+            conn.execute(
+                "INSERT INTO messages(sender_id, receiver_id, product_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user["id"], buyer_id, product_id, "판매자가 상품을 예약중으로 변경했습니다.", timestamp),
+            )
             add_notification(
                 conn,
-                rejected_request["buyer_id"],
+                buyer_id,
                 "transaction",
-                "거래 요청 종료",
-                "다른 구매자의 거래 약속이 확정되어 요청이 종료되었습니다.",
-                action["product_id"],
-                f"/transactions?focus={rejected_request['id']}",
+                "거래 예약 확정",
+                f"{product['title']} 상품이 예약중으로 변경되었습니다.",
+                product_id,
+                f"/chat?user={user['id']}&product={product_id}",
             )
-        return tx_id
+            for rejected_request in rejected_requests:
+                add_notification(
+                    conn,
+                    rejected_request["buyer_id"],
+                    "transaction",
+                    "거래 요청 종료",
+                    "판매자가 다른 구매자와 거래를 예약했습니다.",
+                    product_id,
+                    f"/transactions?focus={rejected_request['id']}",
+                )
+        self.redirect(f"/chat?user={buyer_id}&product={product_id}")
 
     def update_chat_action(self, query, form):
         user = self.require_user()
@@ -4197,7 +4124,8 @@ class App(BaseHTTPRequestHandler):
             action = conn.execute(
                 """
                 SELECT ca.*, p.title FROM chat_actions ca JOIN products p ON p.id = ca.product_id
-                WHERE ca.id = ? AND (ca.buyer_id = ? OR ca.seller_id = ?)
+                WHERE ca.id = ? AND ca.action_type = 'offer'
+                  AND (ca.buyer_id = ? OR ca.seller_id = ?)
                 """,
                 (action_id, user["id"], user["id"]),
             ).fetchone()
@@ -4206,11 +4134,7 @@ class App(BaseHTTPRequestHandler):
             status = "accepted" if decision == "accept" else "rejected"
             peer_id = action["seller_id"] if user["id"] == action["buyer_id"] else action["buyer_id"]
             label = "수락" if decision == "accept" else "거절"
-            detail = f"{'가격 제안' if action['action_type'] == 'offer' else '거래 약속'}을 {label}함"
-            transaction_id = None
-            if decision == "accept" and action["action_type"] == "appointment":
-                transaction_id = self.reserve_transaction_from_appointment(conn, action, user["id"])
-                detail = "거래 약속을 수락해 상품을 예약중으로 확정함"
+            detail = f"가격 제안을 {label}함"
             conn.execute("UPDATE chat_actions SET status = ?, updated_at = ? WHERE id = ?", (status, now(), action_id))
             conn.execute(
                 """
@@ -4226,11 +4150,11 @@ class App(BaseHTTPRequestHandler):
             add_notification(
                 conn,
                 peer_id,
-                "transaction" if transaction_id else action["action_type"],
-                "거래 예약 확정" if transaction_id else f"{action['title']} 제안 응답",
+                action["action_type"],
+                f"{action['title']} 제안 응답",
                 detail,
                 action["product_id"],
-                f"/transactions?focus={transaction_id}" if transaction_id else f"/chat?user={user['id']}&product={action['product_id']}",
+                f"/chat?user={user['id']}&product={action['product_id']}",
             )
         self.redirect(f"/chat?user={peer_id}&product={action['product_id']}")
 
@@ -4265,60 +4189,6 @@ class App(BaseHTTPRequestHandler):
                 (user["id"], peer_id, peer_id, rating, review, now(), now()),
             )
         self.redirect(f"/chat?user={peer_id}")
-
-    def request_transaction(self, query, form):
-        user = self.require_user()
-        if not user:
-            return
-        product_id = int(form.get("product_id", "0") or "0")
-        with db() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            product = conn.execute("SELECT * FROM products WHERE id = ? AND is_deleted = 0", (product_id,)).fetchone()
-            if not product or product["seller_id"] == user["id"] or product["status"] != "판매중":
-                raise ValueError("거래 요청할 수 없는 상품입니다.")
-            existing = conn.execute(
-                """
-                SELECT id FROM transactions
-                WHERE product_id = ? AND buyer_id = ? AND status IN ('거래요청', '예약중')
-                """,
-                (product_id, user["id"]),
-            ).fetchone()
-            if existing:
-                return self.redirect(f"/transactions?focus={existing['id']}")
-            accepted_offer = conn.execute(
-                """
-                SELECT proposed_price FROM chat_actions
-                WHERE product_id = ? AND buyer_id = ? AND seller_id = ?
-                  AND action_type = 'offer' AND status = 'accepted' AND proposed_price > 0
-                ORDER BY id DESC LIMIT 1
-                """,
-                (product_id, user["id"], product["seller_id"]),
-            ).fetchone()
-            agreed_price = accepted_offer["proposed_price"] if accepted_offer else product["price"]
-            tx_id = conn.execute(
-                """
-                INSERT INTO transactions(product_id, seller_id, buyer_id, status, agreed_price, created_at, updated_at)
-                VALUES (?, ?, ?, '거래요청', ?, ?, ?)
-                """,
-                (product_id, product["seller_id"], user["id"], agreed_price, now(), now()),
-            ).lastrowid
-            conn.execute(
-                """
-                INSERT INTO transaction_history(transaction_id, actor_id, from_status, to_status, details, created_at)
-                VALUES (?, ?, '', '거래요청', ?, ?)
-                """,
-                (tx_id, user["id"], f"구매자가 거래를 요청함 · 거래 금액 {won(agreed_price)}", now()),
-            )
-            add_notification(
-                conn,
-                product["seller_id"],
-                "transaction",
-                "새 거래 요청",
-                f"{user['display_name']}님이 거래를 요청했습니다.",
-                product_id,
-                f"/transactions?focus={tx_id}",
-            )
-        self.redirect(f"/transactions?focus={tx_id}")
 
     def transactions_page(self, query, form):
         user = self.require_user()
@@ -4429,7 +4299,7 @@ class App(BaseHTTPRequestHandler):
             if not tx:
                 raise ValueError("송금할 거래를 찾을 수 없습니다.")
             if tx["status"] != "예약중":
-                raise ValueError("판매자가 승인한 예약중 거래에서만 송금할 수 있습니다.")
+                raise ValueError("판매자가 예약중으로 확정한 거래에서만 송금할 수 있습니다.")
             if conn.execute("SELECT 1 FROM wallet_transfers WHERE transaction_id = ?", (tx_id,)).fetchone():
                 raise ValueError("이미 송금이 완료된 거래입니다.")
 
@@ -4542,16 +4412,44 @@ class App(BaseHTTPRequestHandler):
                 conn.execute("UPDATE transactions SET status = '거래거절', updated_at = ? WHERE id = ?", (now(), tx_id))
                 add_notification(conn, tx["buyer_id"], "transaction", "거래 요청 거절", "판매자가 거래 요청을 거절했습니다.", tx["product_id"], f"/transactions?focus={tx_id}")
                 new_status = "거래거절"
-            elif action == "complete" and user["id"] in (tx["buyer_id"], tx["seller_id"]) and tx["status"] == "예약중":
-                conn.execute("UPDATE transactions SET status = '거래완료', updated_at = ? WHERE id = ?", (now(), tx_id))
-                conn.execute("UPDATE products SET status = '거래완료', updated_at = ? WHERE id = ?", (now(), tx["product_id"]))
-                counterpart_id = tx["seller_id"] if user["id"] == tx["buyer_id"] else tx["buyer_id"]
+            elif action == "reopen" and user["id"] == tx["seller_id"] and tx["status"] == "예약중":
+                payment_exists = conn.execute(
+                    "SELECT 1 FROM wallet_transfers WHERE transaction_id = ?",
+                    (tx_id,),
+                ).fetchone()
+                if payment_exists:
+                    raise ValueError("송금이 완료된 거래는 판매중으로 되돌릴 수 없습니다.")
+                timestamp = now()
+                conn.execute("UPDATE transactions SET status = '예약취소', updated_at = ? WHERE id = ?", (timestamp, tx_id))
+                conn.execute("UPDATE products SET status = '판매중', updated_at = ? WHERE id = ?", (timestamp, tx["product_id"]))
+                conn.execute(
+                    "INSERT INTO messages(sender_id, receiver_id, product_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (user["id"], tx["buyer_id"], tx["product_id"], "판매자가 상품을 다시 판매중으로 변경했습니다.", timestamp),
+                )
                 add_notification(
                     conn,
-                    counterpart_id,
+                    tx["buyer_id"],
+                    "transaction",
+                    "예약 취소",
+                    "판매자가 상품을 다시 판매중으로 변경했습니다.",
+                    tx["product_id"],
+                    f"/chat?user={user['id']}&product={tx['product_id']}",
+                )
+                new_status = "예약취소"
+            elif action == "complete" and user["id"] == tx["seller_id"] and tx["status"] == "예약중":
+                timestamp = now()
+                conn.execute("UPDATE transactions SET status = '거래완료', updated_at = ? WHERE id = ?", (timestamp, tx_id))
+                conn.execute("UPDATE products SET status = '거래완료', updated_at = ? WHERE id = ?", (timestamp, tx["product_id"]))
+                conn.execute(
+                    "INSERT INTO messages(sender_id, receiver_id, product_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (user["id"], tx["buyer_id"], tx["product_id"], "판매자가 상품을 거래 완료로 변경했습니다.", timestamp),
+                )
+                add_notification(
+                    conn,
+                    tx["buyer_id"],
                     "transaction",
                     "거래 완료",
-                    f"{user['display_name']}님이 거래 완료를 확인했습니다.",
+                    "판매자가 거래 완료를 확인했습니다.",
                     tx["product_id"],
                     f"/transactions?focus={tx_id}",
                 )
@@ -4662,7 +4560,7 @@ class App(BaseHTTPRequestHandler):
               <div class="evidence-actions"><a class="button danger" href="/report?type=user&id={other_id}&reason=사기 의심">사기 의심 신고</a><a class="button danger" href="/report?type=user&id={other_id}&reason=노쇼">노쇼 신고</a></div>
               <section class="panel table-panel"><h2>WM 포인트 송금</h2><p class="muted">확정 거래 금액 {won(tx["trade_price"])} · 실제 현금 가치가 없는 교육용 기록</p><table><thead><tr><th>일시</th><th>보낸 사용자</th><th>받은 사용자</th><th>금액</th><th>참조번호</th></tr></thead><tbody>{payment_rows}</tbody></table></section>
               <section class="panel table-panel"><h2>거래 상태 이력</h2><table><thead><tr><th>일시</th><th>처리자</th><th>변경</th><th>상세</th></tr></thead><tbody>{history_rows}</tbody></table></section>
-              <section class="panel table-panel"><h2>가격·약속 이력</h2><table><thead><tr><th>일시</th><th>제안자</th><th>종류</th><th>상태</th><th>내용</th></tr></thead><tbody>{action_rows or '<tr><td colspan="5">기록이 없습니다.</td></tr>'}</tbody></table></section>
+              <section class="panel table-panel"><h2>채팅 거래 이력</h2><table><thead><tr><th>일시</th><th>제안자</th><th>종류</th><th>상태</th><th>내용</th></tr></thead><tbody>{action_rows or '<tr><td colspan="5">기록이 없습니다.</td></tr>'}</tbody></table></section>
               <section class="panel table-panel"><h2>거래 채팅</h2><table><thead><tr><th>ID</th><th>일시</th><th>작성자</th><th>내용</th></tr></thead><tbody>{message_rows or '<tr><td colspan="4">기록이 없습니다.</td></tr>'}</tbody></table></section>
             </section>
             """
@@ -5292,28 +5190,32 @@ def transaction_row(t, user, csrf, checklist_map=None):
         </div>
         """
     elif t["status"] == "예약중" and (is_buyer or is_seller):
-        payment_action = ""
-        if is_buyer and not payment_amount:
-            payment_action = f"""
-            <form method="post" action="/transaction/payment" class="inline">
-              {csrf}<input type="hidden" name="id" value="{t["id"]}">
-              <button class="primary">WM 포인트 {won(t["trade_price"])} 송금</button>
-            </form>
+        if is_buyer:
+            payment_action = ""
+            if not payment_amount:
+                payment_action = f"""
+                <form method="post" action="/transaction/payment" class="inline">
+                  {csrf}<input type="hidden" name="id" value="{t["id"]}">
+                  <button class="primary">WM 포인트 {won(t["trade_price"])} 송금</button>
+                </form>
+                """
+            action_form = f"""
+            <div class="tx-actions">
+              {payment_action}
+              <small>{'송금이 완료되었습니다.' if payment_amount else '가상 포인트 송금은 거래당 한 번만 가능합니다.'} 판매자가 거래 상태를 관리합니다.</small>
+            </div>
             """
-        action_form = f"""
-        <div class="tx-actions">
-          {payment_action}
-          <form method="post" action="/transaction/status" class="inline">
-            {csrf}<input type="hidden" name="id" value="{t["id"]}">
-            <button name="action" value="complete">거래 완료</button>
-          </form>
-          <small>{
-            ('송금이 완료되었습니다. ' if payment_amount else '가상 포인트 송금은 거래당 한 번만 가능합니다. ') + '상품을 받은 뒤 거래 완료를 눌러주세요.'
-            if is_buyer
-            else ('거래 대금을 받았습니다. ' if payment_amount else '') + '거래가 끝나면 판매자도 완료 처리할 수 있습니다.'
-          }</small>
-        </div>
-        """
+        else:
+            action_form = f"""
+            <div class="tx-actions">
+              <form method="post" action="/transaction/status" class="inline">
+                {csrf}<input type="hidden" name="id" value="{t["id"]}">
+                <button name="action" value="reopen" {'disabled' if payment_amount else ''}>판매중으로 변경</button>
+                <button class="primary" name="action" value="complete">거래 완료</button>
+              </form>
+              <small>{'송금이 완료되어 판매중으로 되돌릴 수 없습니다.' if payment_amount else '거래가 취소되면 판매중으로 되돌릴 수 있습니다.'}</small>
+            </div>
+            """
     elif is_buyer and t["status"] == "거래요청":
         action_form = '<p class="muted">판매자가 거래 요청을 확인하는 중입니다.</p>'
     review_form = ""
