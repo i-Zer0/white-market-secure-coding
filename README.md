@@ -19,8 +19,8 @@ GitHub: https://github.com/i-Zer0/white-market-secure-coding
 - 개인정보: 내 데이터 JSON 다운로드, 비밀번호 재확인 탈퇴, 상품 비공개, 계정 익명화, 탈퇴 감사 기록
 - 관리자 통계: 회원·상품·거래·신고 현황, 미처리 신고 강조, 최근 14일 증가 추이, 정지·탈퇴 기록
 - 운영: DB 일일 자동 백업·관리자 수동 백업과 복원, 오류 번호별 로그와 처리 상태, 오래된 읽은 알림 정리, 검색·채팅 DB 인덱스
-- 자동 검사: GitHub Actions의 Python 컴파일·Bandit 정적 보안 검사·PR 의존성 검토
-- 홈 화면: 통합 상품 검색, 카테고리 바로가기, WhiteHat School·BoB 교육 광고 슬라이드
+- 자동 검사: 22개 기능·보안 회귀 테스트, GitHub Actions의 Python 컴파일·테스트·Bandit 정적 보안 검사·PR 의존성 검토
+- 홈 화면: 통합 상품 검색, 카테고리 바로가기, WhiteHat School·BoB 교육 광고 슬라이드, 상품 등록 바로가기
 
 ## 보안 반영 사항
 
@@ -162,6 +162,22 @@ $env:WHITE_MARKET_HTTPS="1"
 
 ```bash
 export WHITE_MARKET_HTTPS=1
+```
+
+## 테스트
+
+테스트는 임시 데이터베이스와 임시 업로드 경로를 사용하므로 개발용 `market.db`를 변경하지 않습니다. 다음 명령으로 회원가입, 인증, 권한, 거래 상태, WM 포인트 송금과 주요 웹 취약점 회귀 테스트를 실행합니다.
+
+```powershell
+$env:WHITE_MARKET_ADMIN_PASSWORD="InitialAdmin!2468"
+$env:WHITE_MARKET_BACKUP_KEY="TestBackupKey!2468-secure"
+python -m unittest discover -s tests -v
+```
+
+```bash
+export WHITE_MARKET_ADMIN_PASSWORD='InitialAdmin!2468'
+export WHITE_MARKET_BACKUP_KEY='TestBackupKey!2468-secure'
+python -m unittest discover -s tests -v
 ```
 
 ## 초기 관리자 계정

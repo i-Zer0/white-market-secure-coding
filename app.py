@@ -1747,7 +1747,13 @@ class App(BaseHTTPRequestHandler):
         </section>
         <section class="split">
           <div>
-            <div class="section-title"><h2>최근 상품</h2><a href="/products">전체 보기</a></div>
+            <div class="section-title">
+              <h2>최근 상품</h2>
+              <div class="actions">
+                <a href="/products">전체 보기</a>
+                <a class="primary" href="/product/new">상품 등록</a>
+              </div>
+            </div>
             <div class="grid">{cards}</div>
           </div>
           <aside class="sidebar-stack">
